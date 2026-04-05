@@ -1,0 +1,68 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            // "args": [
+            //     // "${command:pickArgs}"
+            //     "--root", "/data16/Public/Datasets/",
+            //     "--in_dataset", "stanford_cars",
+            //     "--seed" , "1",
+            //     "--trainer", "CoOp",
+            //     "--dataset-config-file", "configs/datasets/stanford_cars.yaml",
+            //     "--config-file", "configs/trainers/LoCoOp/vit_b16_ep200.yaml",
+            //     "--output-dir", "/data/yanjie/code/OOD/LoCoOp_ori/output/stanford_cars/LoCoOp/vit_b16_ep200_16shots/nctx16_cscFalse_ctpend/seed1/",
+            //     "--model-dir", "/data/yanjie/code/OOD/LoCoOp_ori/output/stanford_cars/LoCoOp/vit_b16_ep200_16shots/nctx16_cscFalse_ctpend/seed1/",
+            //     "--lambda_value" ,"0.25",
+            //     "--topk", "120",
+            //     "--load-epoch", "200",
+            //     "--T", "1",
+            //     "TRAINER.LOCOOP.N_CTX", "16",
+            //     "TRAINER.LOCOOP.CSC", "False",
+            //     "TRAINER.LOCOOP.CLASS_TOKEN_POSITION", "end",
+            //     "DATASET.NUM_SHOTS", "16",
+            //     "DATASET.SUBSAMPLE_CLASSES", "base"
+            // ]
+            "args": [
+                // "${command:pickArgs}"
+                "--root", "/data16/Public/Datasets/",
+                "--seed" , "1",
+                "--trainer", "LocProto",
+                "--dataset-config-file", "configs/datasets/fgvc_aircraft.yaml",
+                "--config-file", "configs/trainers/LocProto/vit_b16_ep25.yaml",
+                "--output-dir", "/data/yanjie/code/OOD/LoCoOp_ori/output/fgvc_aircraft/LocProto/vit_b16_ep25_16shots/nctx16_cscFalse_ctpend/seed1_dens_entro_bonder_9.2/",
+                "--lambda_value" ,"0.25",
+                "--topk", "50",
+                "--is_dense", "True",
+                "--is_bonder", "True",
+                "TRAINER.LOCOOP.N_CTX", "16",
+                "TRAINER.LOCOOP.CSC", "False",
+                "TRAINER.LOCOOP.CLASS_TOKEN_POSITION", "end",
+                "DATASET.NUM_SHOTS", "16",
+                "DATASET.SUBSAMPLE_CLASSES", "base"
+            ]
+            // "args": [
+            //     "--root", "/data16/Public/Datasets/",
+            //     "--in_dataset" , "fgvc_aircraft",
+            //     "--trainer" , "ZeroshotCLIP_Contra_OT",
+            //     "--dataset-config-file", "configs/datasets/fgvc_aircraft.yaml",
+            //     "--config-file", "configs/trainers/LoCoOp/vit_b16_ep200.yaml",
+            //     "--T", "1",
+            //     "--topk", "120",
+            //     "--seed", "1",
+            //     "DATASET.SUBSAMPLE_CLASSES", "base"
+            // ]
+        }
+    ]
+}

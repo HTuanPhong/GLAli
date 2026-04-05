@@ -1,0 +1,8 @@
+ftfy
+regex
+tqdm
+seaborn
+medmnist
+timm
+faiss-cpu
+scikit-learn
