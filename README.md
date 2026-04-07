@@ -1,39 +1,5 @@
-# Global and Local Vision-Language Alignment for Few-Shot Learning and Few-Shot OOD Detection
-
-
-## Requirement
-### Package
-Our experiments are conducted with Python 3.8 and Pytorch 1.8.1.
-
-All required packages are based on [CoOp](https://github.com/KaiyangZhou/CoOp) (for training) and [MCM](https://github.com/deeplearning-wisc/MCM) (for evaluation).
-This code is built on top of the awesome toolbox [Dassl.pytorch](https://github.com/KaiyangZhou/Dassl.pytorch) so you need to install the `dassl` environment first. Simply follow the instructions described [here](https://github.com/KaiyangZhou/Dassl.pytorch#installation) to install `dassl` as well as PyTorch. After that, run `pip install -r requirements.txt` under `LoCoOp/` to install a few more packages required by [CLIP](https://github.com/openai/CLIP) and [MCM](https://github.com/deeplearning-wisc/MCM) (this should be done when `dassl` is activated).
-
-
-## Quick Start
-### 1. Training
-The training script is in `./scripts/GLAli/train.sh`.
-
-e.g., 16-shot training with ViT-B/16
-```train
-CUDA_VISIBLE_DEVICES=0 bash scripts/locoop/train.sh
-```
-
-
-### 2. Inference 
-The inference script is in `./scripts/GLAli/eval.sh`.
-
-
-## Acknowledgement
-We adopt these codes to create this repository.
-* [Conditional Prompt Learning for Vision-Language Models](https://arxiv.org/abs/2203.05557), in CVPR, 2022.
-* [Learning to Prompt for Vision-Language Models](https://arxiv.org/abs/2109.01134), IJCV, 2022.
-* [Delving into Out-of-Distribution Detection with Vision-Language Representations](https://proceedings.neurips.cc/paper_files/paper/2022/hash/e43a33994a28f746dcfd53eb51ed3c2d-Abstract-Conference.html), in NeurIPS, 2022
-* [Zero-Shot In-Distribution Detection in Multi-Object Settings Using Vision-Language Foundation Models](https://arxiv.org/abs/2304.04521), arXiv, 2023
-* [LoCoOp: Few-Shot Out-of-Distribution Detection via Prompt Learning](https://proceedings.neurips.cc/paper_files/paper/2023/file/f0606b882692637835e8ac981089eccd-Paper-Conference.pdf), in NeurIPS, 2023
-
-
-## Citaiton
-If you find our work interesting or use our code/models, please consider citing:
+# Attempt to replicate the paper Global and Local Vision-Language Alignment for Few-Shot Learning and Few-Shot OOD Detection
+The paper Authors:
 ```bibtex
 @InProceedings{YanJie_Global_MICCAI2025,
         author = { Yan, Jie AND Guan, Xiaoyuan AND Zheng, Wei-Shi AND Chen, Hao AND Wang, Ruixuan},
@@ -46,3 +12,68 @@ If you find our work interesting or use our code/models, please consider citing:
         page = {208 -- 218}
 }
 ```
+## Acknowledgement
+The author adopt these codes to create this repository.
+* [Conditional Prompt Learning for Vision-Language Models](https://arxiv.org/abs/2203.05557), in CVPR, 2022.
+* [Learning to Prompt for Vision-Language Models](https://arxiv.org/abs/2109.01134), IJCV, 2022.
+* [Delving into Out-of-Distribution Detection with Vision-Language Representations](https://proceedings.neurips.cc/paper_files/paper/2022/hash/e43a33994a28f746dcfd53eb51ed3c2d-Abstract-Conference.html), in NeurIPS, 2022
+* [Zero-Shot In-Distribution Detection in Multi-Object Settings Using Vision-Language Foundation Models](https://arxiv.org/abs/2304.04521), arXiv, 2023
+* [LoCoOp: Few-Shot Out-of-Distribution Detection via Prompt Learning](https://proceedings.neurips.cc/paper_files/paper/2023/file/f0606b882692637835e8ac981089eccd-Paper-Conference.pdf), in NeurIPS, 2023
+
+## About this fork repo:
+It seem the method is replicable after a few change to the codes and adding dataset.
+
+here is how to set it up in kaggle:
+```
+# 1. Enter working directory and clone fixed repo
+%cd /kaggle/working/
+!git clone https://github.com/HTuanPhong/GLAli.git
+%cd GLAli
+!git pull
+
+# 2. cd Dassl toolbox
+!cd Dassl.pytorch && pip install -r requirements.txt && python setup.py develop
+
+# 3. Install GLAli's updated requirements
+!pip install -r requirements.txt
+
+# 4. Create the empty data folder needed for the pkl files
+!mkdir -p ./data/Skin40/split_fewshot
+```
+Training:
+```
+# 5. Run the training!
+!CUDA_VISIBLE_DEVICES=0 bash scripts/GLAli/train.sh
+```
+Evaluation:
+```
+# 6. Run eval
+!CUDA_VISIBLE_DEVICES=0 bash scripts/GLAli/eval.sh
+```
+
+addons:
+```
+# to print out misclassification heatmap
+import torch
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+cmat_path = "/kaggle/working/GLAli/output/skin40/LocProto/vit_b16_ep25_16shots/nctx16_cscFalse_ctpend/seed1_aaaaaa/cmat.pt"
+
+# Add weights_only=False to bypass the PyTorch 2.6 security block
+cmat = torch.load(cmat_path, weights_only=False)
+
+# Plot it professionally
+plt.figure(figsize=(14, 12)) # Made slightly larger for better visibility
+sns.heatmap(cmat, annot=True, fmt=".2f", cmap="Blues", 
+            xticklabels=True, yticklabels=True) # Ensure ticks show up
+
+plt.ylabel('True Disease Class (0-19)', fontsize=12, fontweight='bold')
+plt.xlabel('Predicted Disease Class (0-19)', fontsize=12, fontweight='bold')
+plt.title('Skin40 Misclassification Heatmap', fontsize=16, fontweight='bold')
+
+plt.tight_layout()
+plt.show()
+```
+
+![alt text](notes/heatmap.png)
