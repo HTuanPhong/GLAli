@@ -23,8 +23,6 @@ The author adopt these codes to create this repository.
 ## About this fork repo:
 It seem the method is replicable for accuracy test after a few change to the codes and adding dataset.
 
-However, the authors did not include the code to load the 158 classes of SD-198 for OOD testing in this repository. They lazily copy-pasted the evaluation logic they used for the ISIC dataset (which the paper states did use DermNet as OOD) and applied it to Skin40 in the GitHub release.
-
 here is how to set it up in kaggle:
 ```
 # 1. Enter working directory and clone fixed repo
