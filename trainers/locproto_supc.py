@@ -118,8 +118,34 @@ class TextEncoder(nn.Module):
 
 
 class CustomCLIP(nn.Module):
+    # Added cache_keys and cache_values arguments for Tip-Adapter-F
     def __init__(self, cfg, classnames, clip_model, cache_keys=None, cache_values=None):
         super().__init__()
+        # Adapter module for vision transformer
+        if cfg.Adapter.Visual:
+            self.visual_adapter_learner = Adapter_Learner(
+                    clip_model.visual.ln_post.weight.shape[0],
+                    cfg.Adapter.Layer_ID, cfg.Adapter.Attn, cfg.Adapter.MLP, 
+                    cfg.Adapter.Scale, cfg.Adapter.Down_Rate
+                )
+        else:
+            self.visual_adapter_learner = None
+
+        # Adapter module for text transformer
+        if cfg.Adapter.Text:
+            self.text_adapter_learner = Adapter_Learner(
+                    clip_model.ln_final.weight.shape[0],
+                    cfg.Adapter.Layer_ID, cfg.Adapter.Attn, cfg.Adapter.MLP, 
+                    cfg.Adapter.Scale, cfg.Adapter.Down_Rate
+                )
+        else:
+            self.text_adapter_learner = None
+
+        self.adapter_learners = nn.ModuleDict({
+                "visual_adapter_learner": self.visual_adapter_learner,
+                "text_adapter_learner": self.text_adapter_learner
+            })
+
         self.device = torch.device("cuda")
         clip_model.to(self.device)
         self.image_encoder = clip_model.visual
@@ -133,7 +159,7 @@ class CustomCLIP(nn.Module):
         description_file = os.path.join('./description', f'{cfg.DATASET.NAME}.json')
         print(f'Using description file: {description_file}')
         llm_descriptions = json.load(open(description_file))
-        text_features = []
+        text_features =[]
         template = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         all_prompt =[]
         print(classnames)
@@ -160,13 +186,11 @@ class CustomCLIP(nn.Module):
         self.ndisc = 51
         text_features = text_features.view(self.ndisc, -1, d)
         self.all_text_features_tea = text_features / text_features.norm(dim=-1, keepdim=True)
-        text_features = text_features.mean(dim=0)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features_mean = text_features.mean(dim=0)
+        self.text_features_tea = text_features_mean / text_features_mean.norm(dim=-1, keepdim=True)
         self.text_prototypes = self.all_text_features_tea    # ndisc, C, d
 
-        self.text_features_tea = text_features
-
-        # Bonder (Visually-guided text refinement)
+        # Bonder
         if cfg.is_bonder:
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
@@ -177,9 +201,13 @@ class CustomCLIP(nn.Module):
             print("Initializing Tip-Adapter-F Cache Parameters...")
             self.tip_alpha = 1.0  # Mixing weight for Tip-Adapter
             self.tip_beta = 5.5   # Sharpness parameter for affinity
-            # The Learnable Cache Matrix
-            self.tip_adapter = nn.Linear(cache_keys.shape[0], cache_keys.shape[1], bias=False).to(self.dtype).cuda()
-            self.tip_adapter.weight = nn.Parameter(cache_keys.t())
+            
+            # FIX: nn.Linear expects (in_features, out_features). 
+            # cache_keys is [320, 512]. So we need in_features=512, out_features=320
+            self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
+            
+            # nn.Linear.weight has shape [out_features, in_features], which maps to [320, 512] exactly as cache_keys
+            self.tip_adapter.weight = nn.Parameter(cache_keys) 
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
         # ----------------------------------
 
@@ -257,7 +285,6 @@ class CustomCLIP(nn.Module):
         # -----------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
-
 
 @TRAINER_REGISTRY.register()
 class LocProto(TrainerX):
