@@ -16,11 +16,10 @@ from clip_w_local.simple_tokenizer import SimpleTokenizer as _Tokenizer
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
-from .zsclip_contra import entropy_select_topk2, CUSTOM_TEMPLATES
+from .zsclip_contra import CUSTOM_TEMPLATES
 import os
 import json
 from copy import deepcopy
-from timm.models.layers import DropPath, Mlp
 from utils.bonder import CrossAttnBlock
 from utils.loss import SupConLoss
 
@@ -28,20 +27,6 @@ from utils.data_manager import build_data_loader
 from dassl.data.transforms import build_transform
 
 _tokenizer = _Tokenizer()
-softmax = nn.Softmax(dim=1).cuda()
-
-
-def entropy_select_topk(p, top_k, label, num_of_local_feature):
-    label_repeat = label.repeat_interleave(num_of_local_feature)
-    p = F.softmax(p, dim=-1)
-    pred_topk = torch.topk(p, k=top_k, dim=1)[1]
-    contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(dim=1)
-    selected_p = p[~contains_label]
-
-    if selected_p.shape[0] == 0:
-        return torch.tensor([0]).cuda()
-    return -torch.mean(torch.sum(selected_p * torch.log(selected_p+1e-5), 1))
-
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -275,15 +260,25 @@ class LocProto(TrainerX):
             clip_model.float()
 
         # ---------------- CONSTRUCT EXACT TIP-ADAPTER CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache from training set (Tip-Adapter)...")
-        tfm_test = build_transform(cfg, is_train=False)
+        # print("Extracting Pristine Visual Memory Cache from training set (Tip-Adapter)...")
+        # tfm_test = build_transform(cfg, is_train=False)
+        # cache_loader = build_data_loader(
+        #     cfg,
+        #     sampler_type="SequentialSampler",
+        #     data_source=self.dm.dataset.train_x,
+        #     batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+        #     tfm=tfm_test,
+        #     is_train=False
+        # )
+        print("Extracting Augmented Visual Memory Cache from training set (Tip-Adapter)...")
+        tfm_train = build_transform(cfg, is_train=True)
         cache_loader = build_data_loader(
             cfg,
-            sampler_type="SequentialSampler",
+            sampler_type="SequentialSampler", # Keep sequential so we process all images exactly once
             data_source=self.dm.dataset.train_x,
-            batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
-            tfm=tfm_test,
-            is_train=False
+            batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE, # Use train batch size
+            tfm=tfm_train,
+            is_train=True # Revert to True to apply random crops/flips
         )
 
         clip_model.to(self.device)
@@ -503,71 +498,36 @@ class LocProto(TrainerX):
         return res, res, res, res
 
     @torch.no_grad()
-    def test_ood1(self, data_loader, T):
-        to_np = lambda x: x.data.cpu().numpy()
-        concat = lambda x: np.concatenate(x, axis=0)
-
+    def test_visualize(self, img_path, label_idx):
+        """
+        Generates a 14x14 heatmap showing which parts of the image 
+        the model used to predict the given disease label.
+        """
         self.set_model_mode("eval")
-        self.evaluator.reset()
-
-        glmcm_score =[]
-        mcm_score = []
-        loc_score =[]
-        for batch_idx, batch in enumerate(tqdm(data_loader)):
-            (images, labels, *id_flag) = batch
-            if isinstance(images, str):
-                images, label = self.parse_batch_test(batch)
-                labels = label
-            else:
-                images = images.cuda()
-                labels = labels.cuda()
-            output, output_local, zs_output, zs_local = self.model_inference(images)
-            pred = torch.argmax(output, dim=-1)
-            batch_size, num_of_local_feature, _ = output_local.shape
-            output_local_ = zs_local.view(batch_size * num_of_local_feature, -1)
-
-            selected = entropy_select_topk2(p=output_local_, top_k=self.cfg.topk, label=labels)
-            selected = selected.view(batch_size, num_of_local_feature)
-            attention_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=output.device)
-            attention_mask = torch.cat((attention_mask, selected), dim=1)
-            output2, _, zs_output2, _ = self.model_inference(images, mask=attention_mask)
-
-            output /= 100.0
-            output_local /= 100.0
-            output2 /= 100.0
-            smax_global0 = to_np(F.softmax(output/T, dim=-1))
-            smax_global = to_np(output)
-            smax_local = to_np(F.softmax(output_local/T, dim=-1))
-            smax_global2 = to_np(output2)
-            mcm_global_score = -np.max(smax_global, axis=1)
-            mcm_global_score0 = -np.max(smax_global0, axis=1)
-            contr_score = -np.max(np.abs(smax_global+0.5*(to_np(zs_output)-to_np(zs_output2))), axis=1)
-            mcm_local_score = -np.max(smax_local, axis=(1, 2))
-            mcm_score.append(mcm_global_score)
-            glmcm_score.append(contr_score)
-            loc_score.append(mcm_local_score)
-
-        return concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(glmcm_score)[:len(data_loader.dataset)].copy(), concat(loc_score)[:len(data_loader.dataset)].copy()
-
-    @torch.no_grad()
-    def test_visualize(self, img_path, label):
-        self.set_model_mode("eval")
-        self.evaluator.reset()
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, preprocess = clip.load("ViT-B/16", device=device)
-
-        image = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
-        output, output_local = self.model_inference(image)
-
-        num_regions = output_local.shape[1]
-        label = torch.tensor(label).cuda()
-        label_repeat = label.repeat_interleave(num_regions)
-        output_local = F.softmax(output_local, dim=-1)
-
-        output_local = output_local.view(num_regions, -1)
-
-        pred_topk = torch.topk(output_local, k=200, dim=1)[1]
-        contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(dim=1)
-
-        return contains_label
+        
+        # 1. Use the proper test transforms without re-downloading CLIP
+        from dassl.data.transforms import build_transform
+        from PIL import Image
+        
+        tfm_test = build_transform(self.cfg, is_train=False)
+        image = Image.open(img_path).convert("RGB")
+        image_tensor = tfm_test(image).unsqueeze(0).to(self.device)
+        
+        # 2. Run the image through your Hybrid model
+        # Returns: logits, logits_local, img_tea, img_stu, updated_proto_norm, id_loc, ood_loc, l2p, l2p_tea
+        outputs = self.model(image_tensor)
+        
+        # logits_local shape: [1, 196, num_classes]
+        logits_local = outputs[1] 
+        
+        # 3. Extract the 196 patch scores for the specific disease label
+        patch_scores = logits_local[0, :, label_idx]
+        
+        # 4. Min-Max scale the scores so they look good on a heatmap (0 to 1)
+        patch_scores = patch_scores - patch_scores.min()
+        patch_scores = patch_scores / patch_scores.max()
+        
+        # 5. Reshape to a 14x14 grid
+        heatmap = patch_scores.view(14, 14).cpu().numpy()
+        
+        return heatmap, image

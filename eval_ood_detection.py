@@ -230,5 +230,7 @@ if __name__ == "__main__":
                         help='temperature parameter')
     parser.add_argument('--is_dense', type=bool, default=False,
                         help='temperature parameter')
+    parser.add_argument('--is_sc', type=bool, default=False,
+                        help='temperature parameter')
     args = parser.parse_args()
     main(args)
