@@ -110,3 +110,62 @@ def get_and_print_results(args, in_score, out_score, auroc_list, aupr_list, fpr_
     auroc = np.mean(aurocs); aupr = np.mean(auprs); fpr = np.mean(fprs)
     auroc_list.append(auroc); aupr_list.append(aupr); fpr_list.append(fpr)  # used to calculate the avg over multiple OOD test sets
     print("FPR:{}, AUROC:{}, AURPC:{}".format(fpr, auroc, aupr))
+
+def generate_heatmaps(trainer, dataset_name, output_dir_base="heatmaps"):
+    import os
+    import cv2
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    
+    base_out_dir = os.path.join(output_dir_base, dataset_name)
+    os.makedirs(base_out_dir, exist_ok=True)
+    
+    test_data = trainer.dm.dataset.test
+    print(f"\n[{dataset_name}] Generating heatmaps for {len(test_data)} test images...")
+    
+    for item in tqdm(test_data, desc=f"Visualizing {dataset_name}"):
+        img_path = item.impath
+        label_idx = item.label
+        classname = item.classname
+        
+        class_dir = os.path.join(base_out_dir, classname)
+        os.makedirs(class_dir, exist_ok=True)
+        
+        img_filename = os.path.basename(img_path)
+        save_path = os.path.join(class_dir, img_filename)
+        
+        if os.path.exists(save_path):
+            continue
+            
+        try:
+            heatmap, original_img = trainer.test_visualize(img_path, label_idx)
+
+            heatmap_resized = cv2.resize(heatmap, (224, 224))
+            heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+
+            original_img_resized = original_img.resize((224, 224))
+            overlay = cv2.addWeighted(np.array(original_img_resized), 0.5, heatmap_colored, 0.5, 0)
+
+            fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+            ax[0].imshow(original_img_resized)
+            ax[0].set_title("Original Image", fontsize=14, fontweight='bold')
+            ax[0].axis("off")
+
+            ax[1].imshow(heatmap, cmap='jet')
+            ax[1].set_title("14x14 Patch Activations", fontsize=14, fontweight='bold')
+            ax[1].axis("off")
+
+            ax[2].imshow(overlay)
+            ax[2].set_title(f"Model Focus ({classname})", fontsize=14, fontweight='bold')
+            ax[2].axis("off")
+
+            plt.tight_layout()
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"\nFailed on image: {img_path} | Error: {e}")
+
+    print(f"Heatmaps successfully saved to: {base_out_dir}\n")

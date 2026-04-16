@@ -260,26 +260,26 @@ class LocProto(TrainerX):
             clip_model.float()
 
         # ---------------- CONSTRUCT EXACT TIP-ADAPTER CACHE ----------------
-        # print("Extracting Pristine Visual Memory Cache from training set (Tip-Adapter)...")
-        # tfm_test = build_transform(cfg, is_train=False)
-        # cache_loader = build_data_loader(
-        #     cfg,
-        #     sampler_type="SequentialSampler",
-        #     data_source=self.dm.dataset.train_x,
-        #     batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
-        #     tfm=tfm_test,
-        #     is_train=False
-        # )
-        print("Extracting Augmented Visual Memory Cache from training set (Tip-Adapter)...")
-        tfm_train = build_transform(cfg, is_train=True)
+        print("Extracting Pristine Visual Memory Cache from training set (Tip-Adapter)...")
+        tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
             cfg,
-            sampler_type="SequentialSampler", # Keep sequential so we process all images exactly once
+            sampler_type="SequentialSampler",
             data_source=self.dm.dataset.train_x,
-            batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE, # Use train batch size
-            tfm=tfm_train,
-            is_train=True # Revert to True to apply random crops/flips
+            batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+            tfm=tfm_test,
+            is_train=False
         )
+        # print("Extracting Augmented Visual Memory Cache from training set (Tip-Adapter)...")
+        # tfm_train = build_transform(cfg, is_train=True)
+        # cache_loader = build_data_loader(
+        #     cfg,
+        #     sampler_type="SequentialSampler", # Keep sequential so we process all images exactly once
+        #     data_source=self.dm.dataset.train_x,
+        #     batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE, # Use train batch size
+        #     tfm=tfm_train,
+        #     is_train=True # Revert to True to apply random crops/flips
+        # )
 
         clip_model.to(self.device)
         clip_model.eval()
@@ -505,7 +505,7 @@ class LocProto(TrainerX):
         """
         self.set_model_mode("eval")
         
-        # 1. Use the proper test transforms without re-downloading CLIP
+        # 1. Use the proper test transforms
         from dassl.data.transforms import build_transform
         from PIL import Image
         
@@ -513,21 +513,22 @@ class LocProto(TrainerX):
         image = Image.open(img_path).convert("RGB")
         image_tensor = tfm_test(image).unsqueeze(0).to(self.device)
         
-        # 2. Run the image through your Hybrid model
-        # Returns: logits, logits_local, img_tea, img_stu, updated_proto_norm, id_loc, ood_loc, l2p, l2p_tea
-        outputs = self.model(image_tensor)
+        # 2. Extract image patches directly from the vision encoder
+        _, local_features, _ = self.model.image_encoder(image_tensor.type(self.model.dtype))
+        local_features = local_features / local_features.norm(dim=-1, keepdim=True) # Shape: [1, 196, 512]
         
-        # logits_local shape: [1, 196, num_classes]
-        logits_local = outputs[1] 
+        # 3. Get the text prototype for the requested class
+        # text_features_tea contains the mean text embeddings for all classes [num_classes, 512]
+        target_text = self.model.text_features_tea[label_idx] 
         
-        # 3. Extract the 196 patch scores for the specific disease label
-        patch_scores = logits_local[0, :, label_idx]
+        # 4. Compute cosine similarity between the 196 patches and the text
+        patch_scores = (local_features[0] @ target_text).float() # Shape: [196]
         
-        # 4. Min-Max scale the scores so they look good on a heatmap (0 to 1)
+        # 5. Min-Max scale the scores so they look good on a heatmap (0 to 1)
         patch_scores = patch_scores - patch_scores.min()
-        patch_scores = patch_scores / patch_scores.max()
+        patch_scores = patch_scores / (patch_scores.max() + 1e-8)
         
-        # 5. Reshape to a 14x14 grid
+        # 6. Reshape to a 14x14 grid
         heatmap = patch_scores.view(14, 14).cpu().numpy()
         
         return heatmap, image

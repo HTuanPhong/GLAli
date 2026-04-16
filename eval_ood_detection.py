@@ -140,6 +140,9 @@ def main(args):
     if trainer.cfg.is_bonder and trainer.cfg.TRAINER=="LocProto":
         trainer.model.text_prototypes = torch.load(osp.join(args.model_dir, 'proto.pth'))
 
+    if getattr(args, 'visualize', False):
+        from utils.detection_util import generate_heatmaps
+        generate_heatmaps(trainer, args.in_dataset)
 
     if args.in_dataset in ['skin40', 'ISIC', 'Dermnet']:
         out_datasets = [item for item in ['skin40', 'ISIC', 'Dermnet'] if item != args.in_dataset]
@@ -230,5 +233,7 @@ if __name__ == "__main__":
                         help='temperature parameter')
     parser.add_argument('--is_dense', type=bool, default=False,
                         help='temperature parameter')
+    parser.add_argument('--visualize', action='store_true', 
+                        help='Generate and save heatmaps for the test set instead of OOD eval')
     args = parser.parse_args()
     main(args)
