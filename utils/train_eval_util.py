@@ -175,7 +175,7 @@ def set_ood_loader_ImageNet(args, out_dataset, preprocess=None):
         testsetout = datasets.ImageFolder(root=os.path.join(args.root, 'chestX-ray8', 'test'),
                                           transform=preprocess)
     testloaderOut = torch.utils.data.DataLoader(testsetout, batch_size=args.batch_size,
-                                                shuffle=False, num_workers=8)
+                                                shuffle=False, num_workers=4)
     return testloaderOut
 
 
