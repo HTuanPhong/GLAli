@@ -226,29 +226,29 @@ class CustomCLIP(nn.Module):
 
         # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            # Inference: We don't know the label, so find the most "pathological" patches overall
-            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) # [n_cls, d]
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
             
-            # Sim of all patches to all diseases ->[bs, 196, n_cls]
-            sim_to_all = torch.matmul(local_image_features, text_tea.T)
-            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) # [bs, 196]
+            # FIX 1: Use local_image_features_tea (from the frozen zs_img_encoder)
+            # This ensures the query space EXACTLY matches the cache_keys space!
+            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
+            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
-            # Select Top-K most "disease-like" patches
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            # Extract and average to form the Lesion Query
-            lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
+            lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            # Match lesion query against the Lesion Cache
             affinity = self.tip_adapter(lesion_query)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            scaled_cache_logits = cache_logits * self.tip_alpha
+            affinity = torch.clamp(affinity, max=1.0)
+            cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
+            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
+            scaled_cache_logits = (cache_logits * logit_scale) * gate
+            
+            # FIX 3: Only add to the final logits. Do not corrupt logits_local.
             logits = logits + scaled_cache_logits
-            logits_local = logits_local + scaled_cache_logits
         # -------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
@@ -296,6 +296,7 @@ class LocProto(TrainerX):
         cache_labels =[]
         
         with torch.no_grad():
+            # FIX 2: Use the exact same 51-LLM-description pool used in inference!
             text_tea = self.model.text_features_tea.to(self.device)
             
             for batch in tqdm(cache_loader, desc="Building Cache"):
@@ -476,23 +477,21 @@ class LocProto(TrainerX):
 
         data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
 
-        print(f"Evaluate on the *{split}* set with Test-Time Augmentation (TTA)...")
+        print(f"Evaluate on the *{split}* set")
 
+        if self.cfg.is_bonder:
+            self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
+            
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
-            
-            # Pass 1: Original Image
-            logits_1, _, _, _, _, _, _, _, _ = self.model(input)
-            
-            # Pass 2: Horizontally Flipped Image
-            input_flipped = torch.flip(input, dims=[3])
-            logits_2, _, _, _, _, _, _, _, _ = self.model(input_flipped)
-            
-            # Average the logits for a more robust prediction
-            logits_total = (logits_1 + logits_2) / 2.0
-            
+            output = self.model_inference(input)
+            if len(output) >= 2:
+                if self.cfg.is_bonder:
+                    output = output[1] + 0.05 * output[0]
+                else:
+                    output = output[0]
             self.label.append(label)
-            self.evaluator.process(logits_total, label)
+            self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
 
@@ -518,20 +517,11 @@ class LocProto(TrainerX):
                 images, label = self.parse_batch_test(batch)
             else:
                 images = images.cuda()
-                
-            # Pass 1: Original Image
-            logits_1, _, _, _, _, _, _, _, _ = self.model(images)
-            
-            # Pass 2: Flipped Image
-            images_flipped = torch.flip(images, dims=[3])
-            logits_2, _, _, _, _, _, _, _, _ = self.model(images_flipped)
-            
-            # Average the logits
-            logits_total = (logits_1 + logits_2) / 2.0
-            
-            # Calculate MCM Score on the smoothed, averaged logits
-            logits_total /= 100.0
-            smax_global = to_np(F.softmax(logits_total / T, dim=-1))  
+            output, output_local, _, _, _, _, _, _, _ = self.model_inference(images)
+            if self.cfg.is_bonder:
+                output = output_local + 0.05 * output
+            output /= 100.0
+            smax_global = to_np(F.softmax(output/T, dim=-1))  
             mcm_global_score = -np.max(smax_global, axis=1)
             mcm_score.append(mcm_global_score)
 
