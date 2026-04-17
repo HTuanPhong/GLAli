@@ -154,10 +154,9 @@ class CustomCLIP(nn.Module):
         # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
-            print("Initializing Tip-Adapter-F with Learnable Sigmoid Gate...")
-            
-            # SIGMOID GATE: Learnable class-specific valve parameter
-            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
+            print("Initializing Exact Tip-Adapter-F Cache Parameters...")
+            # Reverted to static floats (not nn.Parameter) to prevent explosion
+            self.tip_alpha = 1.0  
             self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
@@ -227,28 +226,26 @@ class CustomCLIP(nn.Module):
 
         # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
+            # Inference: We don't know the label, so find the most "pathological" patches overall
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) # [n_cls, d]
             
+            # Sim of all patches to all diseases ->[bs, 196, n_cls]
             sim_to_all = torch.matmul(local_image_features, text_tea.T)
-            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
+            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) # [bs, 196]
             
+            # Select Top-K most "disease-like" patches
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
+            # Extract and average to form the Lesion Query
             lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
-            lesion_query = lesion_patches.mean(dim=1)
+            lesion_query = lesion_patches.max(dim=1)[0]
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
+            # Match lesion query against the Lesion Cache
             affinity = self.tip_adapter(lesion_query)
-            
-            # Clamp to prevent negative distances blowing up the exponent
-            affinity = torch.clamp(affinity, max=1.0)
             cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # SIGMOID GATE: Squashes the learnable tip_alpha between 0.0 and 1.0 safely
-            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
-            
-            # Combine the gate AND logit_scale so the cache can mathematically compete with GLAli
-            scaled_cache_logits = (cache_logits * logit_scale) * gate
+            scaled_cache_logits = cache_logits * self.tip_alpha
             
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
@@ -320,7 +317,7 @@ class LocProto(TrainerX):
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
                 
                 # Average lesion patches for cache representation
-                lesion_feat_mean = lesion_feats.mean(dim=1)
+                lesion_feat_mean = lesion_feats.max(dim=1)[0]
                 lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
                 
                 cache_keys.append(lesion_feat_mean.cpu())
@@ -328,11 +325,15 @@ class LocProto(TrainerX):
                 
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
+        # cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
+        # New "Negative Rejection" Cache:
+        one_hot = F.one_hot(cache_labels, num_classes=len(classnames)).float()
+        # Make correct class = 1.0, wrong classes = -0.2 (Penalize look-alikes!)
+        cache_values = torch.where(one_hot == 1.0, 1.0, -0.2).to(self.device)
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
-        # Initialize the learnable gate (0.0 -> sigmoid(0) = 0.5)
-        self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
+
+        print("Injecting Lesion-Only Cache into Tip-Adapter...")
+        self.model.tip_alpha = 1.0  
         self.model.tip_beta = 5.5   
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
@@ -364,11 +365,8 @@ class LocProto(TrainerX):
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
-                
-                # Add BOTH the adapter keys and the new Sigmoid Gate parameter to the optimizer
-                tip_params =[self.model.tip_adapter.weight, self.model.tip_alpha]
-                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
-                
+                # ONLY the keys (adapter.weight) are optimized, NOT tip_alpha
+                self.optim_tip = build_optimizer(self.model.tip_adapter, cfg.OPTIM_TIP)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
             # ----------------------------------------------------------------------
