@@ -238,7 +238,7 @@ class CustomCLIP(nn.Module):
             
             # Extract and average to form the Lesion Query
             lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
-            lesion_query = lesion_patches.max(dim=1)[0]
+            lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
             # Match lesion query against the Lesion Cache
@@ -317,7 +317,7 @@ class LocProto(TrainerX):
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
                 
                 # Average lesion patches for cache representation
-                lesion_feat_mean = lesion_feats.max(dim=1)[0]
+                lesion_feat_mean = lesion_feats.mean(dim=1)
                 lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
                 
                 cache_keys.append(lesion_feat_mean.cpu())
@@ -325,12 +325,7 @@ class LocProto(TrainerX):
                 
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        # cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
-        # New "Negative Rejection" Cache:
-        one_hot = F.one_hot(cache_labels, num_classes=len(classnames)).float()
-        # Make correct class = 1.0, wrong classes = -0.2 (Penalize look-alikes!)
-        cache_values = torch.where(one_hot == 1.0, 1.0, -0.2).to(self.device)
-
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
         print("Injecting Lesion-Only Cache into Tip-Adapter...")
         self.model.tip_alpha = 1.0  
@@ -481,21 +476,23 @@ class LocProto(TrainerX):
 
         data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
 
-        print(f"Evaluate on the *{split}* set")
+        print(f"Evaluate on the *{split}* set with Test-Time Augmentation (TTA)...")
 
-        if self.cfg.is_bonder:
-            self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
-            
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
-            output = self.model_inference(input)
-            if len(output) >= 2:
-                if self.cfg.is_bonder:
-                    output = output[1] + 0.05 * output[0]
-                else:
-                    output = output[0]
+            
+            # Pass 1: Original Image
+            logits_1, _, _, _, _, _, _, _, _ = self.model(input)
+            
+            # Pass 2: Horizontally Flipped Image
+            input_flipped = torch.flip(input, dims=[3])
+            logits_2, _, _, _, _, _, _, _, _ = self.model(input_flipped)
+            
+            # Average the logits for a more robust prediction
+            logits_total = (logits_1 + logits_2) / 2.0
+            
             self.label.append(label)
-            self.evaluator.process(output, label)
+            self.evaluator.process(logits_total, label)
 
         results = self.evaluator.evaluate()
 
@@ -521,11 +518,20 @@ class LocProto(TrainerX):
                 images, label = self.parse_batch_test(batch)
             else:
                 images = images.cuda()
-            output, output_local, _, _, _, _, _, _, _ = self.model_inference(images)
-            if self.cfg.is_bonder:
-                output = output_local + 0.05 * output
-            output /= 100.0
-            smax_global = to_np(F.softmax(output/T, dim=-1))  
+                
+            # Pass 1: Original Image
+            logits_1, _, _, _, _, _, _, _, _ = self.model(images)
+            
+            # Pass 2: Flipped Image
+            images_flipped = torch.flip(images, dims=[3])
+            logits_2, _, _, _, _, _, _, _, _ = self.model(images_flipped)
+            
+            # Average the logits
+            logits_total = (logits_1 + logits_2) / 2.0
+            
+            # Calculate MCM Score on the smoothed, averaged logits
+            logits_total /= 100.0
+            smax_global = to_np(F.softmax(logits_total / T, dim=-1))  
             mcm_global_score = -np.max(smax_global, axis=1)
             mcm_score.append(mcm_global_score)
 
