@@ -154,9 +154,10 @@ class CustomCLIP(nn.Module):
         # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
-            print("Initializing Exact Tip-Adapter-F Cache Parameters...")
-            # Reverted to static floats (not nn.Parameter) to prevent explosion
-            self.tip_alpha = 1.0  
+            print("Initializing Tip-Adapter-F with Learnable Sigmoid Gate...")
+            
+            # SIGMOID GATE: Learnable class-specific valve parameter
+            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
             self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
@@ -328,9 +329,13 @@ class LocProto(TrainerX):
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter...")
-        self.model.tip_alpha = 1.0  
-        self.model.tip_beta = 5.5   
+        print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
+        self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
+        
+        # TWEAK 3 FIX: Must be nn.Parameter Tensors, not plain floats!
+        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
+        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.model.register_buffer("cache_values", cache_values)
@@ -361,8 +366,16 @@ class LocProto(TrainerX):
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
-                # ONLY the keys (adapter.weight) are optimized, NOT tip_alpha
-                self.optim_tip = build_optimizer(self.model.tip_adapter, cfg.OPTIM_TIP)
+                
+                # Pass all 4 learnable Tip-Adapter components to the optimizer
+                tip_params =[
+                    self.model.tip_adapter.weight, 
+                    self.model.tip_alpha,
+                    self.model.tip_beta,
+                    self.model.global_weight
+                ]
+                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
+                
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
             # ----------------------------------------------------------------------
