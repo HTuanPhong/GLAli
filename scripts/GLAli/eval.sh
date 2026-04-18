@@ -37,6 +37,7 @@ do
             --T ${T} \
             --is_bonder True \
             --is_dense True \
+            --visualize \
             DATASET.SUBSAMPLE_CLASSES base \
             DATASET.NUM_SHOTS ${SHOTS}
         done

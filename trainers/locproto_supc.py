@@ -617,26 +617,37 @@ class LocProto(TrainerX):
         return concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(glmcm_score)[:len(data_loader.dataset)].copy(), concat(loc_score)[:len(data_loader.dataset)].copy()
 
     @torch.no_grad()
-    def test_visualize(self, img_path, label):
-        """code for visualization results"""
+    def test_visualize(self, img_path, label_idx):
+        """
+        Generates a 14x14 heatmap showing which parts of the image 
+        the model used to predict the given disease label.
+        """
         self.set_model_mode("eval")
-        self.evaluator.reset()
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, preprocess = clip.load("ViT-B/16", device=device)
-
-        image = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
-        output, output_local = self.model_inference(image)
-
-        num_regions = output_local.shape[1]
-        label = torch.tensor(label).cuda()
-        label_repeat = label.repeat_interleave(num_regions)
-        output_local = F.softmax(output_local, dim=-1)
-
-        output_local = output_local.view(num_regions, -1)
-
-        # -----top 200--------
-        pred_topk = torch.topk(output_local, k=200, dim=1)[1]
-        contains_label = pred_topk.eq(torch.tensor(label_repeat).unsqueeze(1)).any(dim=1)
-
-        return contains_label
+        
+        # 1. Use the proper test transforms
+        from dassl.data.transforms import build_transform
+        from PIL import Image
+        
+        tfm_test = build_transform(self.cfg, is_train=False)
+        image = Image.open(img_path).convert("RGB")
+        image_tensor = tfm_test(image).unsqueeze(0).to(self.device)
+        
+        # 2. Extract image patches directly from the vision encoder
+        _, local_features, _ = self.model.image_encoder(image_tensor.type(self.model.dtype))
+        local_features = local_features / local_features.norm(dim=-1, keepdim=True) # Shape: [1, 196, 512]
+        
+        # 3. Get the text prototype for the requested class
+        # text_features_tea contains the mean text embeddings for all classes [num_classes, 512]
+        target_text = self.model.text_features_tea[label_idx] 
+        
+        # 4. Compute cosine similarity between the 196 patches and the text
+        patch_scores = (local_features[0] @ target_text).float() # Shape: [196]
+        
+        # 5. Min-Max scale the scores so they look good on a heatmap (0 to 1)
+        patch_scores = patch_scores - patch_scores.min()
+        patch_scores = patch_scores / (patch_scores.max() + 1e-8)
+        
+        # 6. Reshape to a 14x14 grid
+        heatmap = patch_scores.view(14, 14).cpu().numpy()
+        
+        return heatmap, image
