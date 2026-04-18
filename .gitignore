@@ -129,5 +129,10 @@ dmypy.json
 .pyre/
 
 # Custom
-output/
+# output/
 debug.sh
+
+datasets/Dermnet/
+datasets/ISIC2019/
+datasets/Skin40/
+
