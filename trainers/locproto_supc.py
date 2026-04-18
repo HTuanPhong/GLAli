@@ -154,9 +154,10 @@ class CustomCLIP(nn.Module):
         # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
-            print("Initializing Exact Tip-Adapter-F Cache Parameters...")
-            # Reverted to static floats (not nn.Parameter) to prevent explosion
-            self.tip_alpha = 1.0  
+            print("Initializing Tip-Adapter-F with Learnable Sigmoid Gate...")
+            
+            # SIGMOID GATE: Learnable class-specific valve parameter
+            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
             self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
@@ -228,27 +229,29 @@ class CustomCLIP(nn.Module):
         if getattr(self, "tip_adapter", None) is not None:
             text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
             
-            # FIX 1: Use local_image_features_tea (from the frozen zs_img_encoder)
-            # This ensures the query space EXACTLY matches the cache_keys space!
-            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
+            sim_to_all = torch.matmul(local_image_features, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
+            lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
             affinity = self.tip_adapter(lesion_query)
             
+            # Clamp to prevent negative distances blowing up the exponent
             affinity = torch.clamp(affinity, max=1.0)
-            cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
+            # SIGMOID GATE: Squashes the learnable tip_alpha between 0.0 and 1.0 safely
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
+            
+            # Combine the gate AND logit_scale so the cache can mathematically compete with GLAli
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # FIX 3: Only add to the final logits. Do not corrupt logits_local.
             logits = logits + scaled_cache_logits
+            logits_local = logits_local + scaled_cache_logits
         # -------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
@@ -328,12 +331,9 @@ class LocProto(TrainerX):
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
         print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
+        # Initialize the learnable gate (0.0 -> sigmoid(0) = 0.5)
         self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
-        
-        # TWEAK 3 FIX: Must be nn.Parameter Tensors, not plain floats!
-        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
-        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
-        
+        self.model.tip_beta = 5.5   
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.model.register_buffer("cache_values", cache_values)
@@ -365,13 +365,8 @@ class LocProto(TrainerX):
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
                 
-                # Pass all 4 learnable Tip-Adapter components to the optimizer
-                tip_params =[
-                    self.model.tip_adapter.weight, 
-                    self.model.tip_alpha,
-                    self.model.tip_beta,
-                    self.model.global_weight
-                ]
+                # Add BOTH the adapter keys and the new Sigmoid Gate parameter to the optimizer
+                tip_params =[self.model.tip_adapter.weight, self.model.tip_alpha]
                 self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
                 
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
