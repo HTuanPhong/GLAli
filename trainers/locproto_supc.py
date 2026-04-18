@@ -158,7 +158,7 @@ class CustomCLIP(nn.Module):
             
             # SIGMOID GATE: Learnable class-specific valve parameter
             self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
-            self.tip_beta = 5.5   
+            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
