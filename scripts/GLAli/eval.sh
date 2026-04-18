@@ -32,7 +32,7 @@ do
             --seed ${SEED} \
             --output-dir output/${DATASET}/${TRAINER}/${CFG}_${SHOTS}shots/nctx${NCTX}_csc${CSC}_ctp${CTP}/seed${SEED}_aaaaaa \
             --model-dir output/${DATASET}/${TRAINER}/${CFG}_${SHOTS}shots/nctx${NCTX}_csc${CSC}_ctp${CTP}/seed${SEED}_aaaaaa \
-            --load-epoch 200 \
+            --load-epoch 100 \
             --config-file configs/trainers/${TRAINER}/${CFG}.yaml \
             --T ${T} \
             --is_bonder True \

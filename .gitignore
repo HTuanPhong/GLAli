@@ -131,3 +131,7 @@ dmypy.json
 # Custom
 output/
 debug.sh
+
+datasets/Dermnet/
+datasets/ISIC2019/
+datasets/Skin40/
