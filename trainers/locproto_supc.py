@@ -20,7 +20,6 @@ from .zsclip_contra import entropy_select_topk2, CUSTOM_TEMPLATES
 import os
 import json
 from copy import deepcopy
-from timm.models.layers import DropPath, Mlp
 from utils.bonder import CrossAttnBlock
 from utils.loss import SupConLoss
 
@@ -55,73 +54,42 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-# =========================================================================
-# SMART FIX 1: FLAWLESS DENSE LOGITS (Spatial & Semantic Routing)
-# =========================================================================
 def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
-    # image_features:[bs, d]
-    # local_image_features: [bs, 196, d]
-    # all_text_features: [51, C, d]
-    # mean_text_features:[C, d]
+    base_logits = image_features @ mean_text_features.T   
+    image_features = image_features.unsqueeze(1)  
+    all_image_features = local_image_features
+    w = torch.einsum('bmd,bnd->bmn', image_features, all_image_features) 
+
+    mean_text_features = mean_text_features.unsqueeze(0) 
+    _,n_cls,d = mean_text_features.shape
+    all_text_features = all_text_features.reshape(-1, n_cls, d)
+    v = torch.einsum('mcd,ncd->mnc', mean_text_features, all_text_features)  
+    v = F.softmax(v, dim=1)
+    sim = torch.einsum('bmd,ncd->bcmn', all_image_features, all_text_features)  
+    sim, idx = sim.topk(dim=2, k=topk)    
+    idx = idx[:, 0, :, 0].unsqueeze(1)
+    w = torch.gather(w, dim=2, index=idx)
+    w = F.softmax(w, dim=-1)
+    weight = torch.einsum('bdm,dnc->bcmn', w,v) 
+    mat = sim * weight
     
-    # 1. Base Global Logits
-    base_logits = image_features @ mean_text_features.T  # [bs, C]
-    
-    # 2. Patch Relevance (w) - How much does the image rely on each patch?
-    w_raw = torch.einsum('bd,bmd->bm', image_features, local_image_features) # [bs, 196]
-    
-    # 3. Symptom Relevance (v) - How much does the class rely on each symptom?
-    all_text_c_n_d = all_text_features.transpose(0, 1) #[C, 51, d]
-    v_raw = torch.einsum('cd,cnd->cn', mean_text_features, all_text_c_n_d) # [C, 51]
-    # Sharpen the symptom focus to ignore noisy LLM hallucinations
-    v = F.softmax(v_raw * 5.0, dim=1) 
-    
-    # 4. Patch-Symptom Similarity
-    sim = torch.einsum('bmd,cnd->bcmn', local_image_features, all_text_c_n_d) #[bs, C, 196, 51]
-    
-    # 5. Extract Top-K Patches PER CLASS PER SYMPTOM (Fixes the author's indexing bug)
-    sim_topk, idx_topk = sim.topk(dim=2, k=topk) # [bs, C, topk, 51]
-    
-    # 6. Gather and Sharpen the corresponding Patch Relevances
-    bs, C_dim = image_features.shape[0], mean_text_features.shape[0]
-    w_expanded = w_raw.view(bs, 1, -1, 1).expand(-1, C_dim, -1, 51) # [bs, C, 196, 51]
-    w_topk = torch.gather(w_expanded, dim=2, index=idx_topk) #[bs, C, topk, 51]
-    w = F.softmax(w_topk * 5.0, dim=2) # Sharpen patch focus
-    
-    # 7. Combine Weights and Sum
-    v_expanded = v.view(1, C_dim, 1, 51) #[1, C, 1, 51]
-    mat = sim_topk * w * v_expanded #[bs, C, topk, 51]
-    bias_logits = torch.sum(mat, dim=(2, 3)) # [bs, C]
-    
-    return base_logits + bias_logits
+    bias_logits = torch.sum(mat, dim=(-2,-1))
+    logits = base_logits + bias_logits
+    return logits
 
 
-# =========================================================================
-# SMART FIX 2: CROSS-MODAL SUPCONLOSS
-# =========================================================================
 def get_supc_loss(g_img_feats, id_loc_feats, ood_loc_feats, text_stu, text_tea, label, n_class=99, topk=50):
     bs, k, d = id_loc_feats.shape
-    
-    # Extract the Mean Text Prototype for the Ground Truth class
-    gt_text = text_stu.transpose(0, 1)[label] # [bs, 51, d]
-    text_mean = gt_text.mean(dim=1).unsqueeze(1) #[bs, 1, d]
-    
-    # Inject the Text Prototype as an additional "view" of the ID class!
-    # This anchors the visual patches directly to the language domain.
-    id_features = torch.cat([id_loc_feats, text_mean], dim=1) # [bs, k+1, d]
-    
-    # Pad OOD features to match shape (duplicate last patch)
-    ood_padding = ood_loc_feats[:, -1:, :]
-    ood_features = torch.cat([ood_loc_feats, ood_padding], dim=1) #[bs, k+1, d]
-    
-    features = torch.cat([id_features, ood_features], dim=0) # [2*bs, k+1, d]
-    
-    id_labels = label 
-    ood_labels = torch.full((bs,), n_class, device=label.device, dtype=label.dtype) 
-    res_label = torch.cat([id_labels, ood_labels], dim=0) 
+    _, n_disc, _ = text_tea.shape
+    id_ex_label = label.unsqueeze(1).repeat(1, k)
+    ood_ex_label = torch.full((bs,), n_class).cuda()
+    text_ex_label = label.unsqueeze(1).repeat(1, n_disc)
 
-    loss_fn = SupConLoss(temperature=0.5, base_temperature=0.5)
-    return loss_fn(features, labels=res_label)
+    features = torch.cat([id_loc_feats, ood_loc_feats], dim=0)
+    res_label = torch.cat([label, ood_ex_label], dim=0)
+
+    loss = SupConLoss(temperature=0.5, base_temperature=0.5)(features=features, labels=res_label)
+    return loss
 
 
 class TextEncoder(nn.Module):
@@ -149,7 +117,8 @@ class CustomCLIP(nn.Module):
         self.device = torch.device("cuda")
         clip_model.to(self.device)
         self.image_encoder = clip_model.visual
-        self.zs_img_encoder = deepcopy(clip_model.visual)
+        
+        # NOTE: zs_img_encoder deleted! We don't need the heavy teacher anymore thanks to ProLIP
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
@@ -162,6 +131,7 @@ class CustomCLIP(nn.Module):
         text_features =[]
         template = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         all_prompt =[]
+        print(classnames)
         
         for classname in classnames:
             prompts =[]
@@ -192,23 +162,21 @@ class CustomCLIP(nn.Module):
         if cfg.is_bonder:
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
-            
-            # SMART FIX 3: Learnable Bonder EMA Gate (Starts at ~0.88 retention)
-            self.bonder_gate = nn.Parameter(torch.tensor(2.0, dtype=self.dtype, device=self.device))
+
+        # --- TaskRes: The Learnable Residual Bias for Text ---
+        self.task_res_R = nn.Parameter(torch.zeros_like(self.text_prototypes)).to(self.dtype).cuda()
 
     def forward(self, image, mask=None, labels = None):
-        with torch.no_grad():
-            image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
-            image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
-        
         image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
 
         text_prototypes = self.text_prototypes.detach()
         n_disc, c, d = text_prototypes.shape
-        id_loc_feats, ood_loc_feats = None, None
-        l2p, l2p_tea = None, None
+        id_loc_feats = None
+        ood_loc_feats = None
+        l2p = None
+        l2p_tea = None
         
         if labels is not None and self.cfg.is_bonder:
             bs = labels.shape[0]
@@ -230,43 +198,44 @@ class CustomCLIP(nn.Module):
             
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
             text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
-            
-            # SMART FIX 3: Dynamic Alpha Gate
-            alpha = torch.sigmoid(self.bonder_gate)
+            alpha = self.cfg.lambda_value
             updated_proto = self.text_prototypes
             
             contra_labels = torch.arange(c).view(-1,1).cuda()
-            mask_l = torch.eq(labels.unsqueeze(1), contra_labels.T).to(self.dtype).cuda()
-            update_features = torch.matmul(mask_l.view(bs, c).transpose(0,1).unsqueeze(0).repeat(n_disc-1,1,1), text_bias.transpose(1, 0))
-            
+            mask = torch.eq(labels.unsqueeze(1), contra_labels.T).to(self.dtype).cuda()
+            update_features = torch.matmul(mask.view(bs, c).transpose(0,1).unsqueeze(0).repeat(n_disc-1,1,1), text_bias.transpose(1, 0))
             proto_mask = torch.zeros(c, dtype=torch.int).cuda()
             proto_mask[labels] = 1
             proto_mask = proto_mask.view(1, -1, 1).repeat(n_disc, 1, d)
             update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
-            
             updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
 
+            # APPLY TASKRES RESIDUAL HERE
+            updated_proto = updated_proto + self.task_res_R
+            
             updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
         else:
-            updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
+            # Inference Path: Apply TaskRes Residual
+            updated_proto = self.text_prototypes + self.task_res_R
+            
+            updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
 
         logit_scale = self.logit_scale.exp()
         
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)      
 
-        return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
+        return logits, logits_local, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
 
 @TRAINER_REGISTRY.register()
 class LocProto(TrainerX):
-
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.LOCOOP.PREC in["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.LOCOOP.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -282,12 +251,12 @@ class LocProto(TrainerX):
         if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
 
-        print("Building custom CLIP (Ultra-Optimized Pure GLAli)")
+        print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
-        print("Turning off gradients in both the image and the text encoder")
+        print("Applying True ProLIP: Unfreezing ONLY visual.proj, Bonder, and TaskRes")
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name:
+            if 'image_encoder.proj' in name or 'bonder' in name or 'task_res_R' in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -300,17 +269,20 @@ class LocProto(TrainerX):
 
         self.model.to(self.device)
         
+        # Save the frozen initial projection matrix for ProLIP MSE Regularization
+        self.proj_init = deepcopy(self.model.image_encoder.proj).detach().cuda()
+
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
-            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
+            # Pass the visual projection matrix AND the TaskRes parameter to the optimizer
+            prolip_params =[self.model.image_encoder.proj, self.model.task_res_R]
+            self.optim = build_optimizer(prolip_params, cfg.OPTIM)
             self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-            self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
+            self.register_model("prolip_learner", self.model.image_encoder.proj, self.optim, self.sched)
             
             if cfg.is_bonder:
                 cfg.OPTIM2 = deepcopy(cfg.OPTIM)
                 cfg.OPTIM2.LR = cfg.OPTIM.LR
-                # Pass both the Bonder weights AND the new Learnable Gate to the optimizer
-                bonder_params =[p for n, p in self.model.named_parameters() if 'bonder' in n]
-                self.optim2 = build_optimizer(bonder_params, cfg.OPTIM2)
+                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM2)
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
@@ -322,56 +294,70 @@ class LocProto(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
+
         prec = self.cfg.TRAINER.LOCOOP.PREC
 
         if prec == "amp":
             with autocast():
-                output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
+                # NOTE: Removed the teacher image feature returns!
+                output, output_local, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
                 all_text_features_tea = self.model.all_text_features_tea.clone()
                 
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
-                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+                
+                # True ProLIP Weight Regularization: MSE(current_proj, initial_proj)
+                mse_loss_fn = nn.MSELoss(reduction='sum')
+                # For ViT-B/16, the parameter is self.model.image_encoder.proj
+                loss_prolip = mse_loss_fn(self.proj_init, self.model.image_encoder.proj)
+                lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
+                
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
+                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
-                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, text_stu, text_tea=l2p_tea, label=label, topk=self.top_k) * 0.5
-                
-                loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+                loss = loss_id + loss_id2 + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
 
-            self.optim.zero_grad()
-            if hasattr(self, 'optim2'): self.optim2.zero_grad()
-            
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self._optims[name].zero_grad()
+                    
             self.scaler.scale(loss).backward()
             
-            self.scaler.step(self.optim)
-            if hasattr(self, 'optim2'): self.scaler.step(self.optim2)
-            
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self.scaler.step(self._optims[name])
             self.scaler.update()
         else:
-            output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
+            output, output_local, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
             all_text_features_tea = self.model.all_text_features_tea.clone()
             
             loss_id = F.cross_entropy(output, label)
             loss_id2 = F.cross_entropy(output_local, label)
-            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+            
+            # True ProLIP Weight Regularization
+            mse_loss_fn = nn.MSELoss(reduction='sum')
+            loss_prolip = mse_loss_fn(self.proj_init, self.model.image_encoder.proj)
+            lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
+            
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
+            loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
-            loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, text_stu, text_tea=l2p_tea, label=label, topk=self.top_k) * 0.5
-            
-            loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+            loss = loss_id + loss_id2 + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
 
-            self.optim.zero_grad()
-            if hasattr(self, 'optim2'): self.optim2.zero_grad()
-            
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self._optims[name].zero_grad()
+                    
             loss.backward()
             
-            self.optim.step()
-            if hasattr(self, 'optim2'): self.optim2.step()
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self._optims[name].step()
 
         loss_summary = {
             "loss": loss.item(),
             "loss_id": loss_id.item(),
-            "loss_distil_img": loss_distil_img.item(),
+            "loss_prolip": loss_prolip.item(),
             "loss_distil_text": loss_distil_text.item(),
             "acc": compute_accuracy(output_local, label)[0].item(),
         }
@@ -390,13 +376,20 @@ class LocProto(TrainerX):
         return input, label
 
     def load_model(self, directory, epoch=None):
-        if not directory: return
+        if not directory:
+            return
+
         names = self.get_model_names()
-        model_file = "model-best.pth.tar" if epoch is None else f"model.pth.tar-{epoch}"
+        model_file = "model-best.pth.tar"
+
+        if epoch is not None:
+            model_file = "model.pth.tar-" + str(epoch)
 
         for name in names:
             model_path = osp.join(directory, name, model_file)
-            if not osp.exists(model_path): raise FileNotFoundError(f'Model not found at "{model_path}"')
+
+            if not osp.exists(model_path):
+                raise FileNotFoundError('Model not found at "{}"'.format(model_path))
 
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
@@ -417,12 +410,19 @@ class LocProto(TrainerX):
         if split is None:
             split = self.cfg.TEST.SPLIT
 
-        data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        elif split == "test":
+            split = "test"  
+            data_loader = self.test_loader
+        else:
+            split = "train"
+            data_loader = self.train_loader_x
+
         print(f"Evaluate on the *{split}* set")
 
         if self.cfg.is_bonder:
             self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
-            
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
             output = self.model_inference(input)
@@ -451,6 +451,7 @@ class LocProto(TrainerX):
         self.set_model_mode("eval")
         self.evaluator.reset()
 
+        glmcm_score = []
         mcm_score =[]
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             (images, labels, *id_flag) = batch
@@ -459,26 +460,66 @@ class LocProto(TrainerX):
             else:
                 images = images.cuda()
             images = images.cuda()
-            output, output_local, _, _, _, _, _, _, _ = self.model_inference(images)
+            output, output_local, _, _, _, _, _, _ = self.model_inference(images)
             if self.cfg.is_bonder:
                 output = output_local + 0.05 * output
             output /= 100.0
+            output_local /= 100.0
             smax_global = to_np(F.softmax(output/T, dim=-1))  
+            smax_local = to_np(F.softmax(output_local/T, dim=-1))
             mcm_global_score = -np.max(smax_global, axis=1)
             mcm_score.append(mcm_global_score)
 
         return concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(mcm_score)[:len(data_loader.dataset)].copy()
 
-    def model_inference(self, input):
-        return self.model(input)
+    @torch.no_grad()
+    def test_ood1(self, data_loader, T):
+        to_np = lambda x: x.data.cpu().numpy()
+        concat = lambda x: np.concatenate(x, axis=0)
 
-    def parse_batch_test(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
-    
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        glmcm_score = []
+        mcm_score =[]
+        loc_score =[]
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            (images, labels, *id_flag) = batch
+            if isinstance(images, str):
+                images, label = self.parse_batch_test(batch)
+                labels = label
+            else:
+                images = images.cuda()
+                labels = labels.cuda()
+            images = images.cuda()
+            output, output_local, zs_output, zs_local = self.model_inference(images)
+            pred = torch.argmax(output, dim=-1)
+            batch_size, num_of_local_feature, _ = output_local.shape
+            output_local_ = zs_local.view(batch_size * num_of_local_feature, -1)
+
+            selected = entropy_select_topk2(p=output_local_, top_k=self.cfg.topk, label=labels)
+            selected = selected.view(batch_size, num_of_local_feature)
+            attention_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=output.device)
+            attention_mask = torch.cat((attention_mask, selected), dim=1)
+            output2, _, zs_output2, _ = self.model_inference(images, mask=attention_mask)
+
+            output /= 100.0
+            output_local /= 100.0
+            output2 /= 100.0
+            smax_global0 = to_np(F.softmax(output/T, dim=-1))
+            smax_global = to_np(output)
+            smax_local = to_np(F.softmax(output_local/T, dim=-1))
+            smax_global2 = to_np(output2)
+            mcm_global_score = -np.max(smax_global, axis=1)
+            mcm_global_score0 = -np.max(smax_global0, axis=1)
+            contr_score = -np.max(np.abs(smax_global+0.5*(to_np(zs_output)-to_np(zs_output2))), axis=1)
+            mcm_local_score = -np.max(smax_local, axis=(1, 2))
+            mcm_score.append(mcm_global_score)
+            glmcm_score.append(contr_score)
+            loc_score.append(mcm_local_score)
+
+        return concat(mcm_score)[:len(data_loader.dataset)].copy(), concat(glmcm_score)[:len(data_loader.dataset)].copy(), concat(loc_score)[:len(data_loader.dataset)].copy()
+
     @torch.no_grad()
     def test_visualize(self, img_path, label_idx):
         """
