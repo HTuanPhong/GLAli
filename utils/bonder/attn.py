@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from timm.models.layers import DropPath, Mlp
 
 
@@ -41,6 +42,7 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
+        # qkv shape:[3, B, num_heads, N, head_dim]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
@@ -48,7 +50,19 @@ class Attention(nn.Module):
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # ---------------------------------------------------------
+        # EXCLUSIVE SELF ATTENTION (XSA) IMPLEMENTATION
+        # 1. Standard attention output (Y)
+        y = attn @ v  # Shape:[B, num_heads, N, head_dim]
+
+        # 2. Normalize Value vectors (Vn)
+        vn = F.normalize(v, dim=-1)
+
+        # 3. Subtract the projection of Y onto Vn (Z = Y - (Y · Vn) * Vn)
+        z = y - (y * vn).sum(dim=-1, keepdim=True) * vn
+        # ---------------------------------------------------------
+
+        x = z.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -59,6 +73,7 @@ class Block(nn.Module):
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
+        # Uses XSA-enabled Attention
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -76,8 +91,8 @@ class CrossAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.head_dim = dim // num_heads
+        self.scale = qk_scale or self.head_dim ** -0.5
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -87,30 +102,48 @@ class CrossAttention(nn.Module):
         self.norm_img = nn.LayerNorm(dim)
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        
+        # Note: In standard cross-attention there are usually linear projections 
+        # for K and V too. Since your original code did not have them, I left 
+        # them out to prevent breaking your model's parameter count/checkpoints.
 
     def forward(self, query, kv):
-        query = self.q(query)
-        k, v = kv, kv
+        B, N_q, C = query.shape
+        _, N_kv, _ = kv.shape
 
-        attn = (query @ k.transpose(1,2)) * self.scale
+        # 1. Project Query and Reshape for Multi-Head
+        # Shape: [B, N_q, C] ->[B, N_q, num_heads, head_dim] -> [B, num_heads, N_q, head_dim]
+        q = self.q(query).reshape(B, N_q, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 2. Reshape K and V for Multi-Head (without additional linear projection, per original code)
+        # Shape: [B, N_kv, C] -> [B, N_kv, num_heads, head_dim] ->[B, num_heads, N_kv, head_dim]
+        k = kv.reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        v = kv.reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 3. Calculate Attention Scores
+        # q:[B, num_heads, N_q, head_dim] @ k.T: [B, num_heads, head_dim, N_kv] 
+        # result: [B, num_heads, N_q, N_kv]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        query = attn @ v
-        query = self.proj(query)
-        query = self.proj_drop(query)
+        # 4. Multiply by Values
+        # attn:[B, num_heads, N_q, N_kv] @ v:[B, num_heads, N_kv, head_dim]
+        # result:[B, num_heads, N_q, head_dim]
+        out = attn @ v
 
-        return query
+        # 5. Concatenate Heads Back Together
+        # Shape: [B, num_heads, N_q, head_dim] ->[B, N_q, num_heads, head_dim] -> [B, N_q, C]
+        out = out.transpose(1, 2).reshape(B, N_q, C)
+
+        # 6. Final Projection
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        return out
 
 
 class CrossAttnBlock(nn.Module):
-    """
-    input: embedded_tokens
-            (x)  tokens -> projection(Linear), project to new Q,K,V -> LN + Cross-Attention + LN + MLP
-            (√)  tokens -> LN + self-attn -> LN + cross-attn -> LN + MLP
-          residual:     |------------------+| |---------------+| |-----+|
-    output: tokens
-    """
     def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,):
         super(CrossAttnBlock, self).__init__()
