@@ -416,7 +416,7 @@ class LocProto(TrainerX):
                     output = output[1] + 0.05 * output[0]
                 else:
                     output = output[0]
-            self.label.append(label)
+            
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
