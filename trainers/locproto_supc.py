@@ -273,11 +273,15 @@ class LocProto(TrainerX):
         self.proj_init = deepcopy(self.model.image_encoder.proj).detach().cuda()
 
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
-            # Pass the visual projection matrix AND the TaskRes parameter to the optimizer
-            prolip_params =[self.model.image_encoder.proj, self.model.task_res_R]
-            self.optim = build_optimizer(prolip_params, cfg.OPTIM)
+            # Gather ALL parameters that require gradients (proj, TaskRes R, and Bonder)
+            trainable_params =[p for p in self.model.parameters() if p.requires_grad]
+            
+            self.optim = build_optimizer(trainable_params, cfg.OPTIM)
             self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-            self.register_model("prolip_learner", self.model.image_encoder.proj, self.optim, self.sched)
+            
+            # Register the entire model as an nn.Module (Fixes the 'Parameter' attribute error)
+            # This also ensures save_model() and load_model() correctly save everything to one file.
+            self.register_model("model", self.model, self.optim, self.sched)
             
             if cfg.is_bonder:
                 cfg.OPTIM2 = deepcopy(cfg.OPTIM)
