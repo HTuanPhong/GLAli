@@ -404,12 +404,14 @@ class LocProto(TrainerX):
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
             output = self.model_inference(input)
+            
             if len(output) >= 2:
                 if self.cfg.is_bonder:
                     output = output[1] + 0.05 * output[0]
                 else:
                     output = output[0]
-            self.label.append(label)
+                    
+            # DELETED: self.label.append(label) - This was causing the crash!
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
