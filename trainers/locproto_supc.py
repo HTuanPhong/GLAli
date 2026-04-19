@@ -232,31 +232,29 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
 
-        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
+        # ---------------- RESTORED: GLOBAL TIP-ADAPTER (THE 71.5% MATH) ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
-            
-            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
-            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
-            
-            _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
-            
-            lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
-            lesion_query = lesion_patches.mean(dim=1)
-            lesion_query = F.normalize(lesion_query, p=2, dim=-1)
+            # Query the cache using the GLOBAL feature, not the lesion patches!
+            # Use the frozen global feature to prevent feature drift.
+            with torch.no_grad():
+                global_feat_tea, _, _ = self.zs_img_encoder(image.type(self.dtype))
+                global_feat_tea = F.normalize(global_feat_tea, p=2, dim=-1)
             
             normalized_cache_keys = F.normalize(self.tip_adapter.weight, p=2, dim=1)
-            affinity = F.linear(lesion_query, normalized_cache_keys)
+            affinity = F.linear(global_feat_tea, normalized_cache_keys)
             
             safe_beta = F.softplus(self.tip_beta)
+            
+            # AMP safety: Match dtypes
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
-            scaled_cache_logits = (cache_logits * logit_scale) * gate
+            # DIRECT MULTIPLIER: No sigmoid, no logit_scale. Just the raw learnable alpha.
+            scaled_cache_logits = cache_logits * self.tip_alpha.to(affinity.dtype)
             
+            # Inject cache into both global and local decision making
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
-        # ---------------------------------------------------------------------------------------
+        # -------------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -286,7 +284,7 @@ class LocProto(TrainerX):
         self.model.to(self.device)
 
         # ---------------- CONSTRUCT LESION-ONLY TIP-ADAPTER CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache (Lesion-Only) from training set...")
+        print("Extracting Pristine Visual Memory Cache (Global Features) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
             cfg,
@@ -297,58 +295,42 @@ class LocProto(TrainerX):
             is_train=False
         )
 
-        self.model.eval()
+        clip_model.to(self.device)
+        clip_model.eval()
         
-        cache_keys = []
+        cache_keys =[]
         cache_labels =[]
         
         with torch.no_grad():
-            # FIX 2: Use the exact same 51-LLM-description pool used in inference!
-            text_tea = self.model.text_features_tea.to(self.device)
-            
-            for batch in tqdm(cache_loader, desc="Building Cache"):
+            for batch in tqdm(cache_loader, desc="Building Global Cache"):
                 image = batch["img"].to(self.device)
                 label = batch["label"].to(self.device)
                 
-                # Extract local features via the frozen visual encoder
-                _, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
-                local_feat = F.normalize(local_feat, p=2, dim=-1)
+                # EXTRACT GLOBAL FEATURES (This restores your 71.5% memory logic)
+                img_feat, _, _ = clip_model.visual(image.type(clip_model.dtype))
+                img_feat = F.normalize(img_feat, p=2, dim=-1)
                 
-                # Use ground truth label to find EXACT lesion patches
-                gt_text = text_tea[label].unsqueeze(1) # [bs, 1, d]
-                sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1) #[bs, 196]
-                
-                # Get Top-K lesion patches
-                _, idx_pos = torch.topk(sim_to_gt, k=self.top_k, dim=1)
-                
-                d_dim = local_feat.shape[-1]
-                lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
-                
-                # Average lesion patches for cache representation
-                lesion_feat_mean = lesion_feats.mean(dim=1)
-                lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
-                
-                cache_keys.append(lesion_feat_mean.cpu())
+                cache_keys.append(img_feat.cpu())
                 cache_labels.append(label.cpu())
                 
+        # DTYPE FIX: Ensure keys and values are explicitly moved to self.model.dtype
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter with Learnable Gating...")
+        print("Injecting Global Cache into Tip-Adapter with Class-Specific Alpha...")
         
-        # RESTORED: global_weight starts at 1.0 (Full power to base logits)
-        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        # START FULLY ACTIVE: Initialize class-specific alpha to 1.0
+        self.model.tip_alpha = nn.Parameter(torch.ones(1, len(classnames), dtype=clip_model.dtype, device=self.device))
+        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=clip_model.dtype, device=self.device))
+        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=clip_model.dtype, device=self.device))
         
-        # THE FIX: Initialize gate to -4.0. Sigmoid(-4) is 0.018. Starts closed to prevent NaN explosions!
-        self.model.tip_alpha = nn.Parameter(torch.full((1, len(classnames)), -4.0, dtype=self.model.dtype, device=self.device))
-        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
-        
-        self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
+        self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(clip_model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.model.register_buffer("cache_values", cache_values)
+        # -----------------------------------------------------------------------------
 
-        print("Configuring Gradients...")
+        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys & Gates")
         for name, param in self.model.named_parameters():
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
