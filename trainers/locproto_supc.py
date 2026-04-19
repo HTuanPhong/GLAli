@@ -43,7 +43,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
     base_logits = image_features @ mean_text_features.T   
     image_features = image_features.unsqueeze(1)  
     all_image_features = local_image_features
@@ -63,7 +63,9 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    logits = base_logits + bias_logits
+    
+    # Apply global weight properly
+    logits = (global_weight * base_logits) + bias_logits
     return logits
 
 
@@ -199,7 +201,9 @@ class CustomCLIP(nn.Module):
             ood_loc_feats = torch.gather(local_image_features, 1, idx_ood.unsqueeze(-1).expand(-1, -1, d))
             
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
-            text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
+            text_bias = text_bias / (text_bias.norm(dim=-1, keepdim=True) + 1e-7)
+            
+            # RESTORED: Use the config's lambda_value for the Bonder alpha
             alpha = self.cfg.lambda_value
             updated_proto = self.text_prototypes
             
@@ -212,25 +216,26 @@ class CustomCLIP(nn.Module):
             update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
             updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
 
-            updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
+            updated_proto_norm = updated_proto / (updated_proto.norm(dim=-1, keepdim=True) + 1e-7)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+            updated_proto_mean_norm = updated_proto_mean / (updated_proto_mean.norm(dim=-1, keepdim=True) + 1e-7)
         else:
-            updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
+            updated_proto_norm = self.text_prototypes / (self.text_prototypes.norm(dim=-1, keepdim=True) + 1e-7)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+            updated_proto_mean_norm = updated_proto_mean / (updated_proto_mean.norm(dim=-1, keepdim=True) + 1e-7)
+
+        local_image_features_tea = local_image_features_tea / (local_image_features_tea.norm(dim=-1, keepdim=True) + 1e-7)
 
         logit_scale = self.logit_scale.exp()
+        g_weight = getattr(self, "global_weight", 1.0)
         
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
 
-        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
+        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
+            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
             
-            # FIX 1: Use local_image_features_tea (from the frozen zs_img_encoder)
-            # This ensures the query space EXACTLY matches the cache_keys space!
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
@@ -240,17 +245,18 @@ class CustomCLIP(nn.Module):
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            affinity = self.tip_adapter(lesion_query)
+            normalized_cache_keys = F.normalize(self.tip_adapter.weight, p=2, dim=1)
+            affinity = F.linear(lesion_query, normalized_cache_keys)
             
-            affinity = torch.clamp(affinity, max=1.0)
-            cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            safe_beta = F.softplus(self.tip_beta)
+            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # FIX 3: Only add to the final logits. Do not corrupt logits_local.
             logits = logits + scaled_cache_logits
-        # -------------------------------------------------------------------
+            logits_local = logits_local + scaled_cache_logits
+        # ---------------------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -325,25 +331,31 @@ class LocProto(TrainerX):
                 cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
                 
-        cache_keys = torch.cat(cache_keys, dim=0).to(self.device) 
+        cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
-        self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
+        print("Injecting Lesion-Only Cache into Tip-Adapter with Learnable Gating...")
         
-        # TWEAK 3 FIX: Must be nn.Parameter Tensors, not plain floats!
-        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
+        # RESTORED: global_weight starts at 1.0 (Full power to base logits)
         self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        
+        # THE FIX: Initialize gate to -4.0. Sigmoid(-4) is 0.018. Starts closed to prevent NaN explosions!
+        self.model.tip_alpha = nn.Parameter(torch.full((1, len(classnames)), -4.0, dtype=self.model.dtype, device=self.device))
+        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
         
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.model.register_buffer("cache_values", cache_values)
-        # -------------------------------------------------------------------------
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
+        print("Configuring Gradients...")
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
+            if ('image_encoder.transformer.resblocks.11.attn' in name or 
+                'bonder' in name or 
+                'tip_adapter' in name or 
+                'tip_alpha' in name or 
+                'tip_beta' in name or 
+                'global_weight' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -351,39 +363,33 @@ class LocProto(TrainerX):
         self.model.to(self.device)
         
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
+            # RESTORED: Normal LR for Vision Encoder (Unchoked!)
             self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
             self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
             self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
             
             if cfg.is_bonder:
                 cfg.OPTIM2 = deepcopy(cfg.OPTIM)
-                cfg.OPTIM2.LR = cfg.OPTIM.LR
                 self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM2)
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            # ---------------- FIX 3: CORRECT TIP-ADAPTER OPTIMIZER ----------------
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
-                cfg.OPTIM_TIP.LR = 0.001
+                cfg.OPTIM_TIP.LR = 0.001 # Small LR for gates
                 
-                # Pass all 4 learnable Tip-Adapter components to the optimizer
                 tip_params =[
                     self.model.tip_adapter.weight, 
-                    self.model.tip_alpha,
-                    self.model.tip_beta,
+                    self.model.tip_alpha, 
+                    self.model.tip_beta, 
                     self.model.global_weight
                 ]
                 self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
-                
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ----------------------------------------------------------------------
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
-
-        device_count = torch.cuda.device_count()
-        if device_count > 1:
+        if torch.cuda.device_count() > 1:
             self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
@@ -397,8 +403,10 @@ class LocProto(TrainerX):
                 
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
-                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
-                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
+                
+                # RESTORED: Distillation back to 10.0 to anchor the vision model correctly
+                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10.0
+                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25.0
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
@@ -420,8 +428,8 @@ class LocProto(TrainerX):
             
             loss_id = F.cross_entropy(output, label)
             loss_id2 = F.cross_entropy(output_local, label)
-            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
-            loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
+            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10.0
+            loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25.0
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
             loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
