@@ -334,7 +334,7 @@ class LocProto(TrainerX):
                 loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 
-                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, text_stu, text_tea=l2p_tea, label=label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
+                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, text_stu, text_tea=l2p_tea, label=label, topk=self.top_k) * 0.5
                 
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
@@ -356,7 +356,7 @@ class LocProto(TrainerX):
             loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             
-            loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, text_stu, text_tea=l2p_tea, label=label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
+            loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, text_stu, text_tea=l2p_tea, label=label, topk=self.top_k) * 0.5
             
             loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
