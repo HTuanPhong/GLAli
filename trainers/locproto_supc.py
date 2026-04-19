@@ -57,7 +57,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
     base_logits = image_features @ mean_text_features.T   
     image_features = image_features.unsqueeze(1)  
     all_image_features = local_image_features
@@ -77,7 +77,12 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    logits = base_logits + bias_logits
+    
+    # DTYPE FIX: Safely cast global_weight to match base_logits (FP16 in AMP)
+    if isinstance(global_weight, torch.Tensor):
+        global_weight = global_weight.to(base_logits.dtype)
+        
+    logits = (global_weight * base_logits) + bias_logits
     return logits
 
 
@@ -228,39 +233,43 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        g_weight = getattr(self, "global_weight", 1.0)
+        
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
 
-        # ---------------- FEEDBACK FIXES: LESION CACHE + SIGMOID GATE ----------------
+        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            # FIX 1: Query using FROZEN local_image_features_tea to prevent feature drift mismatch!
-            local_image_features_tea = local_image_features_tea / (local_image_features_tea.norm(dim=-1, keepdim=True) + 1e-7)
-            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
+            # We don't know the label, so find the most "pathological" patches overall
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) 
             
-            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
+            sim_to_all = torch.matmul(local_image_features, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
+            lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
+            # Normalize adapter weights to keep affinity strictly bounded
             normalized_cache_keys = F.normalize(self.tip_adapter.weight, p=2, dim=1)
             affinity = F.linear(lesion_query, normalized_cache_keys)
             
-            safe_beta = F.softplus(self.tip_beta)
+            # DTYPE FIX: Cast learnable beta to match affinity (FP16)
+            safe_beta = F.softplus(self.tip_beta).to(affinity.dtype)
+            
+            # DTYPE FIX: Cast cache_values to match affinity (FP16)
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # SIGMOID GATING: Soft gate [1, n_cls], bounded between 0 and 1
-            gate = torch.sigmoid(self.tip_gate).to(affinity.dtype)
+            # DTYPE FIX: Cast learnable alpha gate to match affinity (FP16)
+            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
             
-            # Match GLAli's inflated logit space, but controlled safely by the gate
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # FIX 3: Double-Dipping Prevented. We DO NOT add cache to logits_local!
             logits = logits + scaled_cache_logits
-        # -----------------------------------------------------------------------------
+            logits_local = logits_local + scaled_cache_logits
+        # ---------------------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
