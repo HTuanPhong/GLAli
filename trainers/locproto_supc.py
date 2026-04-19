@@ -282,12 +282,12 @@ class LocProto(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
+        if cfg.TRAINER.LOCOOP.PREC in["fp32", "amp"]:
             clip_model.float()
 
         print("Building custom CLIP")
-        # Build model first to obtain pristine text_features_tea
-        self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=None, cache_values=None)
+        # FIX: Removed the unexpected 'cache_keys' and 'cache_values' kwargs
+        self.model = CustomCLIP(cfg, classnames, clip_model)
         self.model.to(self.device)
 
         # ---------------- CONSTRUCT LESION-ONLY TIP-ADAPTER CACHE ----------------
@@ -308,14 +308,13 @@ class LocProto(TrainerX):
         cache_labels =[]
         
         with torch.no_grad():
-            # FIX 2: Use the exactly matched 51-symptom average text features from the model
             text_tea = self.model.text_features_tea.to(self.device)
             
             for batch in tqdm(cache_loader, desc="Building Cache"):
                 image = batch["img"].to(self.device)
                 label = batch["label"].to(self.device)
                 
-                # FEEDBACK 1: Extract local features via the FROZEN visual encoder
+                # Extract local features via the FROZEN visual encoder
                 _, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
                 local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
@@ -333,14 +332,17 @@ class LocProto(TrainerX):
                 cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
                 
-        cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(self.model.dtype) 
+        cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(self.model.dtype) 
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
 
         print("Injecting Lesion-Only Cache into Tip-Adapter with Learnable Gating...")
         
-        # GATE FIX: Start at -4.0 (Sigmoid(-4) = ~0.018) to prevent initial gradient explosion
-        self.model.tip_gate = nn.Parameter(torch.full((1, len(classnames)), -4.0, dtype=self.model.dtype, device=self.device))
+        # RESTORED: global_weight starts at 1.0 (Full power to base logits)
+        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        
+        # THE FIX: Initialize gate to -4.0. Sigmoid(-4) is 0.018. Starts closed to prevent NaN explosions!
+        self.model.tip_alpha = nn.Parameter(torch.full((1, len(classnames)), -4.0, dtype=self.model.dtype, device=self.device))
         self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
         
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
@@ -353,8 +355,9 @@ class LocProto(TrainerX):
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
                 'tip_adapter' in name or 
-                'tip_gate' in name or 
-                'tip_beta' in name):
+                'tip_alpha' in name or 
+                'tip_beta' in name or 
+                'global_weight' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -376,14 +379,22 @@ class LocProto(TrainerX):
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
+                
+                # Wrapped parameters in a list so the optimizer accepts it
                 tip_params =[
                     self.model.tip_adapter.weight, 
-                    self.model.tip_gate, 
-                    self.model.tip_beta
+                    self.model.tip_alpha, 
+                    self.model.tip_beta, 
+                    self.model.global_weight
                 ]
                 self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
+
+        elif "RN" in cfg.MODEL.BACKBONE.NAME:
+            self.optim = build_optimizer(self.model.image_encoder.attnpool, cfg.OPTIM)
+            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+            self.register_model("attn_learner", self.model.image_encoder.attnpool, self.optim, self.sched)
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
 
