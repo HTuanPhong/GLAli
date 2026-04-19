@@ -297,19 +297,18 @@ class LocProto(TrainerX):
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
                 
-                # GLAli Distillation Losses
-                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+                # --- THE FIX: We deleted loss_distil_img. ProLIP handles vision safety now! ---
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 
                 # GLAli LocSC Loss
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
-                # ProLIP Weight Regularization: Frobenius Norm (Sum of Squared Errors)
+                # ProLIP Weight Regularization (Replaces Image Distillation)
                 loss_prolip = torch.sum((self.model.image_encoder.proj - self.proj_init) ** 2)
-                # lambda for ProLIP is exactly 1 / N_shots
                 lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
                 
-                loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
+                # Perfect Synergy Loss
+                loss = loss_id + loss_id2 + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
 
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
@@ -322,7 +321,7 @@ class LocProto(TrainerX):
             loss_id = F.cross_entropy(output, label)
             loss_id2 = F.cross_entropy(output_local, label)
             
-            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+            # --- THE FIX: We deleted loss_distil_img. ProLIP handles vision safety now! ---
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
@@ -330,7 +329,8 @@ class LocProto(TrainerX):
             loss_prolip = torch.sum((self.model.image_encoder.proj - self.proj_init) ** 2)
             lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
             
-            loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
+            # Perfect Synergy Loss
+            loss = loss_id + loss_id2 + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
 
             self.optim.zero_grad()
             loss.backward()
