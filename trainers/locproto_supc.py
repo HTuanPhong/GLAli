@@ -24,6 +24,8 @@ from utils.bonder import CrossAttnBlock
 from utils.loss import SupConLoss
 
 _tokenizer = _Tokenizer()
+softmax = nn.Softmax(dim=1).cuda()
+
 
 def entropy_select_topk(p, top_k, label, num_of_local_feature):
     label_repeat = label.repeat_interleave(num_of_local_feature)
@@ -105,7 +107,6 @@ class TextEncoder(nn.Module):
         x, _, _, _ = self.transformer(x)
         x = x.permute(1, 0, 2)  
         x = self.ln_final(x).type(self.dtype)
-
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
@@ -115,8 +116,9 @@ class CustomCLIP(nn.Module):
         super().__init__()
         self.device = torch.device("cuda")
         clip_model.to(self.device)
+        
+        # PROLIP VISION: We only need ONE image encoder now! Vision Teacher is deleted.
         self.image_encoder = clip_model.visual
-        self.zs_img_encoder = deepcopy(clip_model.visual)
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
@@ -126,9 +128,10 @@ class CustomCLIP(nn.Module):
         print(f'Using description file: {description_file}')
         llm_descriptions = json.load(open(description_file))
         
-        text_features = []
+        text_features =[]
         template = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         all_prompt =[]
+        print(classnames)
         
         for classname in classnames:
             prompts =[]
@@ -153,6 +156,7 @@ class CustomCLIP(nn.Module):
         self.ndisc = 51
         text_features = text_features.view(self.ndisc, -1, d)
         
+        # TEXT TEACHER (GLAli Anchor): Kept intact to stabilize the Bonder
         self.all_text_features_tea = text_features / text_features.norm(dim=-1, keepdim=True)
         text_features_mean = text_features.mean(dim=0)
         self.text_features_tea = text_features_mean / text_features_mean.norm(dim=-1, keepdim=True)
@@ -163,10 +167,7 @@ class CustomCLIP(nn.Module):
             self.bonder.to(self.dtype)
 
     def forward(self, image, mask=None, labels=None):
-        with torch.no_grad():
-            image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
-            image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
-        
+        # Student Vision Pass (Tuned via ProLIP projection)
         image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
@@ -187,7 +188,6 @@ class CustomCLIP(nn.Module):
 
             sim = local_image_features @ (l2p.mean(dim=1, keepdim=True).transpose(1, 2))
             sim = sim.squeeze(-1)
-            
             _, idx = torch.topk(input=sim, k=self.cfg.topk)
             _, idx_ood = torch.topk(input=sim, k=self.cfg.topk, largest=False)
 
@@ -203,21 +203,24 @@ class CustomCLIP(nn.Module):
             updated_proto = self.text_prototypes
             
             contra_labels = torch.arange(c).view(-1, 1).cuda()
-            mask_labels = torch.eq(labels.unsqueeze(1), contra_labels.T).to(self.dtype).cuda()
+            mask_lbl = torch.eq(labels.unsqueeze(1), contra_labels.T).to(self.dtype).cuda()
             
-            update_features = torch.matmul(mask_labels.view(bs, c).transpose(0, 1).unsqueeze(0).repeat(n_disc-1, 1, 1), text_bias.transpose(1, 0))
+            update_features = torch.matmul(mask_lbl.view(bs, c).transpose(0, 1).unsqueeze(0).repeat(n_disc-1, 1, 1), text_bias.transpose(1, 0))
             
             proto_mask = torch.zeros(c, dtype=torch.int).cuda()
             proto_mask[labels] = 1
             proto_mask = proto_mask.view(1, -1, 1).repeat(n_disc, 1, d)
             
             update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
+            
+            # GLAli Instance Bias (Bonder dynamically adjusts text)
             updated_proto = (1 - proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1 - alpha) * update_features)
 
             updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
         else:
+            # Inference Path: Pure ProLIP Vision + Baseline GLAli Text
             updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
@@ -227,7 +230,8 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)      
 
-        return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
+        # Return exactly what is needed for GLAli Brain + ProLIP losses
+        return logits, logits_local, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
 
 @TRAINER_REGISTRY.register()
@@ -251,11 +255,9 @@ class LocProto(TrainerX):
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
-        print("Applying Pure GLAli + ProLIP: Unfreezing Attention, Bonder, and Visual Projection")
-        
+        print("Applying ProLIP Vision + GLAli Brain: Tuning ONLY visual.proj and Bonder")
         for name, param in self.model.named_parameters():
-            # EXACT Integration: GLAli's Attention & Bonder + ProLIP's Projection Matrix
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'image_encoder.proj' in name:
+            if 'image_encoder.proj' in name or 'bonder' in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -291,23 +293,24 @@ class LocProto(TrainerX):
 
         if prec == "amp":
             with autocast():
-                output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
+                output, output_local, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
                 all_text_features_tea = self.model.all_text_features_tea.clone()
                 
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
                 
-                # --- THE FIX: We deleted loss_distil_img. ProLIP handles vision safety now! ---
-                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
-                
-                # GLAli LocSC Loss
-                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
-                
-                # ProLIP Weight Regularization (Replaces Image Distillation)
-                loss_prolip = torch.sum((self.model.image_encoder.proj - self.proj_init) ** 2)
+                # ProLIP Vision Regularization: MSE(current_proj, initial_proj)
+                mse_loss_fn = nn.MSELoss(reduction='sum')
+                loss_prolip = mse_loss_fn(self.proj_init, self.model.image_encoder.proj)
                 lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
                 
-                # Perfect Synergy Loss
+                # GLAli Text Regularization: Keep text stable relative to Teacher text
+                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
+                
+                # GLAli LocSC Loss: Foregound/Background Separation
+                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
+                
+                # Total Hybrid Loss (No Image Distillation needed!)
                 loss = loss_id + loss_id2 + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
 
             self.optim.zero_grad()
@@ -315,21 +318,19 @@ class LocProto(TrainerX):
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
+            output, output_local, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
             all_text_features_tea = self.model.all_text_features_tea.clone()
             
             loss_id = F.cross_entropy(output, label)
             loss_id2 = F.cross_entropy(output_local, label)
             
-            # --- THE FIX: We deleted loss_distil_img. ProLIP handles vision safety now! ---
+            mse_loss_fn = nn.MSELoss(reduction='sum')
+            loss_prolip = mse_loss_fn(self.proj_init, self.model.image_encoder.proj)
+            lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
+            
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
-            # ProLIP Weight Regularization
-            loss_prolip = torch.sum((self.model.image_encoder.proj - self.proj_init) ** 2)
-            lambda_prolip = 1.0 / self.cfg.DATASET.NUM_SHOTS 
-            
-            # Perfect Synergy Loss
             loss = loss_id + loss_id2 + loss_distil_text + loss_supc + (lambda_prolip * loss_prolip)
 
             self.optim.zero_grad()
@@ -340,6 +341,7 @@ class LocProto(TrainerX):
             "loss": loss.item(),
             "loss_id": loss_id.item(),
             "loss_prolip": loss_prolip.item(),
+            "loss_distil_text": loss_distil_text.item(),
             "acc": compute_accuracy(output_local, label)[0].item(),
         }
 
@@ -375,6 +377,11 @@ class LocProto(TrainerX):
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
 
+            keys_to_delete =[k for k in state_dict.keys() if "token_prefix" in k or "token_suffix" in k]
+            for k in keys_to_delete:
+                if k in state_dict:
+                    del state_dict[k]
+
             print(f'Loading weights to {name} from "{model_path}"')
             self._models[name].load_state_dict(state_dict, strict=False)
 
@@ -404,14 +411,12 @@ class LocProto(TrainerX):
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
             output = self.model_inference(input)
-            
             if len(output) >= 2:
                 if self.cfg.is_bonder:
                     output = output[1] + 0.05 * output[0]
                 else:
                     output = output[0]
-                    
-            # DELETED: self.label.append(label) - This was causing the crash!
+            self.label.append(label)
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
@@ -433,13 +438,8 @@ class LocProto(TrainerX):
 
         mcm_score =[]
         for batch_idx, batch in enumerate(tqdm(data_loader)):
-            (images, labels, *id_flag) = batch
-            if isinstance(images, str):
-                images, label = self.parse_batch_test(batch)
-            else:
-                images = images.cuda()
-            
-            output, output_local, _, _, _, _, _, _, _ = self.model_inference(images)
+            images = batch[0].cuda() if isinstance(batch, (list, tuple)) else batch["img"].cuda()
+            output, output_local, _, _, _, _, _, _ = self.model_inference(images)
             
             if self.cfg.is_bonder:
                 output = output_local + 0.05 * output
@@ -456,13 +456,7 @@ class LocProto(TrainerX):
         return self.model(input)
 
     def parse_batch_test(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-
-        input = input.to(self.device)
-        label = label.to(self.device)
-
-        return input, label
+        return batch["img"].to(self.device), batch["label"].to(self.device)
 
     @torch.no_grad()
     def test_visualize(self, img_path, label_idx):
