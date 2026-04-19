@@ -369,14 +369,20 @@ class LocProto(TrainerX):
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
-                # ONLY tuning adapter.weight!
-                self.optim_tip = build_optimizer(self.model.tip_adapter.weight, cfg.OPTIM_TIP)
+                # THE FIX: Wrapped the parameter in a list [] so PyTorch optimizer accepts it!
+                self.optim_tip = build_optimizer([self.model.tip_adapter.weight], cfg.OPTIM_TIP)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ------------------------------------------------------------------
-            
+
+        elif "RN" in cfg.MODEL.BACKBONE.NAME:
+            self.optim = build_optimizer(self.model.image_encoder.attnpool, cfg.OPTIM)
+            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+            self.register_model("attn_learner", self.model.image_encoder.attnpool, self.optim, self.sched)
+
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
-        if torch.cuda.device_count() > 1:
+
+        device_count = torch.cuda.device_count()
+        if device_count > 1:
             self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
