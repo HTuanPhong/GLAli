@@ -58,7 +58,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
     base_logits = image_features @ mean_text_features.T   
     image_features = image_features.unsqueeze(1)  
     all_image_features = local_image_features
@@ -78,9 +78,7 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    
-    # Global weight applied to dynamically balance base vs local
-    logits = (global_weight * base_logits) + bias_logits
+    logits = base_logits + bias_logits
     return logits
 
 
@@ -170,14 +168,13 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        # ---------------- HYBRID TIP-ADAPTER-F PARAMETERS ----------------
-        self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.dtype))
+        # ---------------- SAFE TIP-ADAPTER-F PARAMETERS ----------------
         self.tip_adapter = None
-        
         if cache_keys is not None:
-            print("Initializing Hybrid Tip-Adapter-F with Sigmoid Gate...")
-            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))
-            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
+            print("Initializing Static Hybrid Tip-Adapter-F...")
+            # Static floats to avoid FP16 AdamW explosion
+            self.tip_alpha = 1.0
+            self.tip_beta = 5.5
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
@@ -244,16 +241,14 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         
-        g_weight = torch.clamp(self.global_weight, min=0.0, max=1.0)
-        
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
 
-        # ---------------- HYBRID TIP-ADAPTER WITH SIGMOID GATING ----------------
+        # ---------------- TWEAK 1 & 2: HYBRID TIP-ADAPTER ----------------
         if getattr(self, "tip_adapter", None) is not None:
             text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
             
-            # 1. Use the frozen teacher features for cache matching (Domain Drift Fix)
+            # TWEAK 1: Use frozen local_image_features_tea to query the cache! (Domain Drift Fix)
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
@@ -263,24 +258,19 @@ class CustomCLIP(nn.Module):
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            # 2. Hybrid Query (Global + Lesion)
+            # TWEAK 2: Hybrid Query (Global + Lesion)
             hybrid_query = F.normalize(image_features_tea + lesion_query, p=2, dim=-1)
             
-            # 3. Match against Hybrid Cache
             affinity = self.tip_adapter(hybrid_query)
-            affinity = torch.clamp(affinity, max=1.0)
             
-            safe_beta = torch.clamp(F.softplus(self.tip_beta), max=10.0)
+            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
-            
-            # 4. Gate and Scale
-            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
-            scaled_cache_logits = (cache_logits * logit_scale) * gate
+            # Scaled to match CLIP logit space
+            scaled_cache_logits = (cache_logits * logit_scale) * self.tip_alpha
             
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
-        # ------------------------------------------------------------------------
+        # -----------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -305,7 +295,7 @@ class LocProto(TrainerX):
         if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
 
-        # ---------------- CONSTRUCT HYBRID TIP-ADAPTER CACHE ----------------
+        # ---------------- TWEAK 2: CONSTRUCT HYBRID TIP-ADAPTER CACHE ----------------
         print("Extracting Pristine Visual Memory Cache (Hybrid Global+Lesion) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
@@ -358,14 +348,11 @@ class LocProto(TrainerX):
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=cache_keys, cache_values=cache_values)
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys & Gates")
+        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
         for name, param in self.model.named_parameters():
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
-                'tip_adapter' in name or 
-                'tip_alpha' in name or 
-                'tip_beta' in name or 
-                'global_weight' in name):
+                'tip_adapter' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -378,34 +365,13 @@ class LocProto(TrainerX):
 
         self.model.to(self.device)
         
-        if "ViT" in cfg.MODEL.BACKBONE.NAME:
-            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
-            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-            self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
-            
-            if cfg.is_bonder:
-                cfg.OPTIM2 = deepcopy(cfg.OPTIM)
-                cfg.OPTIM2.LR = cfg.OPTIM.LR
-                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM2)
-                self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
-                self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
-
-            # ---------------- FIX: EXACT ADAMW TIP-ADAPTER OPTIMIZER ----------------
-            if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
-                tip_params =[
-                    self.model.tip_adapter.weight, 
-                    self.model.tip_alpha, 
-                    self.model.tip_beta, 
-                    self.model.global_weight
-                ]
-                
-                # Demand 3: Hardcode AdamW + LR 0.001
-                self.optim_tip = torch.optim.AdamW(tip_params, lr=0.001, weight_decay=1e-4)
-                self.sched_tip = torch.optim.lr_scheduler.CosineAnnealingLR(self.optim_tip, float(cfg.OPTIM.MAX_EPOCH))
-                
-                self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ------------------------------------------------------------------------
-
+        # ---------------- SGD OPTIMIZER (NO ADAMW NaN EXPLOSION) ----------------
+        # We place ALL parameters (including Tip-Adapter keys) into the standard, safe SGD optimizer
+        trainable_params =[p for p in self.model.parameters() if p.requires_grad]
+        self.optim = build_optimizer(trainable_params, cfg.OPTIM)
+        self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        self.register_model("model", self.model, self.optim, self.sched)
+        
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
 
         device_count = torch.cuda.device_count()
@@ -414,6 +380,7 @@ class LocProto(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
+
         prec = self.cfg.TRAINER.LOCOOP.PREC
 
         if prec == "amp":
@@ -429,16 +396,9 @@ class LocProto(TrainerX):
                 
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
-            for name in self._optims:
-                if self._optims[name] is not None:
-                    self._optims[name].zero_grad()
-                    
+            self.optim.zero_grad()
             self.scaler.scale(loss).backward()
-            
-            for name in self._optims:
-                if self._optims[name] is not None:
-                    self.scaler.step(self._optims[name])
-                    
+            self.scaler.step(self.optim)
             self.scaler.update()
         else:
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
@@ -452,15 +412,9 @@ class LocProto(TrainerX):
             
             loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
-            for name in self._optims:
-                if self._optims[name] is not None:
-                    self._optims[name].zero_grad()
-                    
+            self.optim.zero_grad()
             loss.backward()
-            
-            for name in self._optims:
-                if self._optims[name] is not None:
-                    self._optims[name].step()
+            self.optim.step()
 
         loss_summary = {
             "loss": loss.item(),
@@ -500,7 +454,8 @@ class LocProto(TrainerX):
 
             keys_to_delete =[k for k in state_dict.keys() if "token_prefix" in k or "token_suffix" in k]
             for k in keys_to_delete:
-                del state_dict[k]
+                if k in state_dict:
+                    del state_dict[k]
 
             print(f'Loading weights to {name} from "{model_path}"')
             self._models[name].load_state_dict(state_dict, strict=False)
