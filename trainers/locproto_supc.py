@@ -64,8 +64,11 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
     
-    # Applied Global Weight
+    # Safe Global Weight application
+    if isinstance(global_weight, torch.Tensor):
+        global_weight = torch.clamp(global_weight, min=0.0)
     logits = (global_weight * base_logits) + bias_logits
+    
     return logits
 
 
@@ -159,7 +162,6 @@ class CustomCLIP(nn.Module):
         self.tip_adapter = None
         if cache_keys is not None:
             print("Initializing Exact Tip-Adapter-F Cache Parameters...")
-            # Init at 1.0 -> Sigmoid(1.0) = ~0.73. Gives strong early cache support.
             self.tip_alpha = nn.Parameter(torch.ones(1, len(classnames), dtype=self.dtype))
             self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
             
@@ -224,18 +226,18 @@ class CustomCLIP(nn.Module):
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
 
-        logit_scale = self.logit_scale.exp()
+        # ---> SAFEGURAD 1: Clamp Logit Scale to prevent global explosion <---
+        logit_scale = self.logit_scale.exp().clamp(max=100.0)
         
         g_weight = getattr(self, "global_weight", 1.0)
         
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
 
-        # ---------------- IMPROVED: HYBRID CACHE QUERY WITH SIGMOID GATING ----------------
+        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
         if getattr(self, "tip_adapter", None) is not None:
             text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
             
-            # FIX 1: MUST query with Teacher features to prevent domain drift
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
@@ -245,12 +247,20 @@ class CustomCLIP(nn.Module):
             lesion_query_tea = lesion_patches.mean(dim=1)
             lesion_query_tea = F.normalize(lesion_query_tea, p=2, dim=-1)
             
-            # FIX 2: Hybrid Query (Global + Lesion). Maximizes ID Accuracy without losing OOD focus.
+            # Hybrid Query
             cache_query = F.normalize(image_features_tea + lesion_query_tea, p=2, dim=-1)
             
             affinity = self.tip_adapter(cache_query)
             
-            safe_beta = torch.clamp(F.softplus(self.tip_beta), max=10.0)
+            # ---> SAFEGUARD 2: THE CRITICAL FIX <---
+            # By clamping affinity to a max of 1.0, (1.0 - affinity) is NEVER negative.
+            # This makes it mathematically impossible for torch.exp() to overflow in FP16.
+            affinity = torch.clamp(affinity, max=1.0)
+            
+            # Prevent Beta from exploding
+            safe_beta = torch.clamp(F.softplus(self.tip_beta), max=20.0)
+            
+            # Math is strictly bounded: exp(x) where x <= 0.
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
@@ -298,7 +308,7 @@ class LocProto(TrainerX):
         clip_model.to(self.device)
         clip_model.eval()
         
-        cache_keys = []
+        cache_keys =[]
         cache_labels =[]
         
         with torch.no_grad():
@@ -323,7 +333,6 @@ class LocProto(TrainerX):
                 lesion_feat_mean = lesion_feats.mean(dim=1)
                 lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
                 
-                # Hybrid Key: Global + Lesion
                 hybrid_key = F.normalize(img_feat + lesion_feat_mean, p=2, dim=-1)
                 
                 cache_keys.append(hybrid_key.cpu())
@@ -376,7 +385,7 @@ class LocProto(TrainerX):
                     self.model.tip_beta, 
                     self.model.global_weight
                 ]
-                # Force AdamW as required by Tip-Adapter-F paper for cache learning
+                # Force AdamW with a safe LR to prevent erratic behavior
                 self.optim_tip = torch.optim.AdamW(tip_params, lr=0.001, weight_decay=1e-4)
                 self.sched_tip = torch.optim.lr_scheduler.CosineAnnealingLR(self.optim_tip, T_max=cfg.OPTIM.MAX_EPOCH)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
