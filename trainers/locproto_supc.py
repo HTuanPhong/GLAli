@@ -43,7 +43,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
     base_logits = image_features @ mean_text_features.T   
     image_features = image_features.unsqueeze(1)  
     all_image_features = local_image_features
@@ -63,9 +63,7 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    
-    # EXACT FIX: The function now accepts global_weight and properly scales the base (global) logits
-    logits = (global_weight * base_logits) + bias_logits
+    logits = base_logits + bias_logits
     return logits
 
 
@@ -224,21 +222,15 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         
-        g_weight = getattr(self, "global_weight", 1.0)
-        
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
-        
-        # PURE GRADIENT FIX: logits_local must remain completely isolated from the cache 
-        # so that loss_id2 forces the student Vision Encoder to learn perfectly!
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
 
-        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
+        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            # DOMAIN GAP FIX: We MUST use local_image_features_tea to query the cache.
-            # The cache was built with the Teacher. If we query with the Student, the features 
-            # drift during training and the affinity collapses. Using Teacher = 100% Stable Anchor.
-            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
             
+            # FIX 1: Use local_image_features_tea (from the frozen zs_img_encoder)
+            # This ensures the query space EXACTLY matches the cache_keys space!
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
@@ -250,23 +242,15 @@ class CustomCLIP(nn.Module):
             
             affinity = self.tip_adapter(lesion_query)
             
-            # STABILITY FIX: Clamp affinity to max 1.0 to prevent negative distance blowouts
             affinity = torch.clamp(affinity, max=1.0)
+            cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # STABILITY FIX: Softplus ensures beta is strictly positive, clamped to 10.0 to prevent Inf
-            safe_beta = torch.clamp(F.softplus(self.tip_beta), max=10.0)
-            
-            # DTYPE FIX: Explicitly cast cache_values to affinity.dtype to guarantee NO AMP crashes
-            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
-            
-            # DTYPE FIX: Explicitly cast the sigmoid gate to match AMP precision
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
-            
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # Add cache ONLY to the final global decision. 
+            # FIX 3: Only add to the final logits. Do not corrupt logits_local.
             logits = logits + scaled_cache_logits
-        # ---------------------------------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
