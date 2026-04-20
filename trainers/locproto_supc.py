@@ -54,7 +54,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
     base_logits = image_features @ mean_text_features.T   
     image_features = image_features.unsqueeze(1)  
     all_image_features = local_image_features
@@ -74,9 +74,7 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    
-    # Global weight applied strictly to the base logits
-    logits = (global_weight * base_logits) + bias_logits
+    logits = base_logits + bias_logits
     return logits
 
 
@@ -164,15 +162,13 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        # ---------------- PURE LESION TIP-ADAPTER-F MEMORY CACHE ----------------
+        # ---------------- HYBRID TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
-            print("Initializing Tip-Adapter-F with Lesion Query and Sigmoid Gate...")
+            print("Initializing Tip-Adapter-F with Hybrid Query and Single Scalar Gate...")
             
-            # Sigmoid Gate: Learnable class-specific valve parameter
-            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
-            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
-            self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.dtype))
+            # SINGLE SCALAR GATE: Minimal learning, maximum stability
+            self.tip_alpha = nn.Parameter(torch.tensor(0.0, dtype=self.dtype))  
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
@@ -240,16 +236,14 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         
-        g_weight = getattr(self, "global_weight", 1.0)
-        
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
 
-        # ---------------- PURE LESION QUERY + SIGMOID GATE ----------------
+        # ---------------- TWEAK 1 & 2: HYBRID QUERY WITH SCALAR SIGMOID GATE ----------------
         if getattr(self, "tip_adapter", None) is not None:
             text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
             
-            # Tweak 1: Query using Frozen Teacher's local features to prevent domain drift
+            # Tweak 1: Query cache using Teacher's local features to prevent domain drift
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
@@ -257,24 +251,23 @@ class CustomCLIP(nn.Module):
             
             lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query_tea = lesion_patches.mean(dim=1)
+            lesion_query_tea = F.normalize(lesion_query_tea, p=2, dim=-1)
             
-            # Tweak 2 Reverted: Pure Lesion Query Only! (No global background pollution)
-            pure_lesion_query = F.normalize(lesion_query_tea, p=2, dim=-1)
+            # Tweak 2: Hybrid Query (Global Teacher Feat + Local Lesion Teacher Query)
+            hybrid_query_tea = image_features_tea + lesion_query_tea
+            hybrid_query_tea = F.normalize(hybrid_query_tea, p=2, dim=-1)
             
-            affinity = self.tip_adapter(pure_lesion_query)
-            
-            # Clamps to ensure numerical stability during AMP training
+            affinity = self.tip_adapter(hybrid_query_tea)
             affinity = torch.clamp(affinity, max=1.0)
-            safe_beta = torch.clamp(F.softplus(self.tip_beta), max=10.0)
             
-            # Exact AMP DType alignment
-            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            # Fixed Beta = 5.5 for stable cache matching
+            cache_logits = torch.exp(-5.5 * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # Sigmoid Gate
+            # Single Scalar Sigmoid Gating (Safely bound between 0 and 1)
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
             
-            # CRITICAL FIX: DO NOT multiply by logit_scale here. Let Tip-Adapter act as a soft, safe nudge.
-            scaled_cache_logits = cache_logits * gate
+            # Logit scale applied here so cache mathematically competes with GLAli
+            scaled_cache_logits = cache_logits * logit_scale * gate
             
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
@@ -303,8 +296,8 @@ class LocProto(TrainerX):
         if cfg.TRAINER.LOCOOP.PREC in["fp32", "amp"]:
             clip_model.float()
 
-        # ---------------- CONSTRUCT PRISTINE LESION-ONLY TIP-ADAPTER CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache (Pure Lesion) from training set...")
+        # ---------------- CONSTRUCT PRISTINE HYBRID TIP-ADAPTER CACHE ----------------
+        print("Extracting Pristine Visual Memory Cache (Hybrid Global + Lesion) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
             cfg,
@@ -318,7 +311,7 @@ class LocProto(TrainerX):
         clip_model.to(self.device)
         clip_model.eval()
         
-        cache_keys =[]
+        cache_keys = []
         cache_labels =[]
         
         with torch.no_grad():
@@ -345,14 +338,16 @@ class LocProto(TrainerX):
             text_tea = text_features_mean / text_features_mean.norm(dim=-1, keepdim=True)
             text_tea = text_tea.to(self.device)
             
-            for batch in tqdm(cache_loader, desc="Building Lesion Cache"):
+            for batch in tqdm(cache_loader, desc="Building Hybrid Cache"):
                 image = batch["img"].to(self.device)
                 label = batch["label"].to(self.device)
                 
                 # Extract features via frozen visual encoder
-                _, local_feat, _ = clip_model.visual(image.type(clip_model.dtype))
+                global_feat, local_feat, _ = clip_model.visual(image.type(clip_model.dtype))
+                global_feat = F.normalize(global_feat, p=2, dim=-1)
                 local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
+                # Find EXACT lesion patches
                 gt_text = text_tea[label].unsqueeze(1) 
                 sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1) 
                 
@@ -361,11 +356,15 @@ class LocProto(TrainerX):
                 d_dim = local_feat.shape[-1]
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
                 
+                # Average lesion patches
                 lesion_feat_mean = lesion_feats.mean(dim=1)
                 lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
                 
-                # PURE LESION (No global feature mixed in to pollute the cache!)
-                cache_keys.append(lesion_feat_mean.cpu())
+                # Tweak 2 Applied: Hybrid Query (Global + Lesion) for Cache Keys
+                hybrid_feat = global_feat + lesion_feat_mean
+                hybrid_feat = F.normalize(hybrid_feat, p=2, dim=-1)
+                
+                cache_keys.append(hybrid_feat.cpu())
                 cache_labels.append(label.cpu())
                 
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
@@ -375,14 +374,12 @@ class LocProto(TrainerX):
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=cache_keys, cache_values=cache_values)
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys & Gates")
+        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Scalar Gate")
         for name, param in self.model.named_parameters():
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
                 'tip_adapter' in name or 
-                'tip_alpha' in name or 
-                'tip_beta' in name or 
-                'global_weight' in name):
+                'tip_alpha' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -410,11 +407,10 @@ class LocProto(TrainerX):
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
+                # Only 2 parameters learning for Cache: the keys and the scalar gate
                 tip_params =[
                     self.model.tip_adapter.weight, 
-                    self.model.tip_alpha, 
-                    self.model.tip_beta, 
-                    self.model.global_weight
+                    self.model.tip_alpha
                 ]
                 self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
@@ -509,6 +505,7 @@ class LocProto(TrainerX):
             if not osp.exists(model_path):
                 raise FileNotFoundError(f'Model not found at "{model_path}"')
 
+            from dassl.utils import load_checkpoint
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
 
