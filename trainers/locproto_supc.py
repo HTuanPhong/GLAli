@@ -20,12 +20,16 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 from clip_w_local import clip_clear as clip
 from clip_w_local.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .zsclip_contra import entropy_select_topk2, CUSTOM_TEMPLATES
+from timm.models.layers import DropPath, Mlp
 from utils.bonder import CrossAttnBlock
 from utils.loss import SupConLoss
+
 from utils.data_manager import build_data_loader
 from dassl.data.transforms import build_transform
 
 _tokenizer = _Tokenizer()
+softmax = nn.Softmax(dim=1).cuda()
+
 
 def entropy_select_topk(p, top_k, label, num_of_local_feature):
     label_repeat = label.repeat_interleave(num_of_local_feature)
@@ -73,9 +77,9 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     weight = torch.einsum('bdm,dnc->bcmn', w, v) 
     mat = sim * weight
     
-    bias_logits = torch.sum(mat, dim=(-2, -1))
+    bias_logits = torch.sum(mat, dim=(-2,-1))
     
-    # TWEAK 3: Dynamic Global Weight applied to base logits
+    # Global weight applied to dynamically balance base vs local
     logits = (global_weight * base_logits) + bias_logits
     return logits
 
@@ -113,35 +117,14 @@ class TextEncoder(nn.Module):
         return x
 
 
-class TipAdapter(nn.Module):
-    """
-    TWEAK 3: Encapsulates all Tip-Adapter parameters (Keys, Alpha Gate, Beta, Global Weight)
-    so they can be cleanly passed to AdamW.
-    """
-    def __init__(self, cache_keys, n_cls, dtype):
-        super().__init__()
-        self.weight = nn.Parameter(cache_keys)
-        # Learnable class-specific sigmoid gate (starts at 0.0 -> Sigmoid(0) = 0.5)
-        self.tip_alpha = nn.Parameter(torch.zeros(1, n_cls, dtype=dtype))
-        self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=dtype))
-        self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=dtype))
-        
-    def forward(self, x):
-        return F.linear(x, self.weight)
-
-
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model, cache_keys=None, cache_values=None):
         super().__init__()
         self.device = torch.device("cuda")
         clip_model.to(self.device)
-        self.image_encoder = clip_model.visual
         
-        # GLAli Core: Frozen Teacher
+        self.image_encoder = clip_model.visual
         self.zs_img_encoder = deepcopy(clip_model.visual)
-        for param in self.zs_img_encoder.parameters():
-            param.requires_grad_(False)
-            
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
@@ -164,12 +147,12 @@ class CustomCLIP(nn.Module):
             for i in range(50):
                 prompt_desc = prompt + ' ' + llm_descriptions[classname.replace("_", " ")][i]
                 prompts.append(prompt_desc)
-            prompts_tokenized = torch.cat([clip.tokenize(p) for p in prompts]).cuda()
-            all_prompt.append(prompts_tokenized)
+            prompts = torch.cat([clip.tokenize(p) for p in prompts]).cuda()
+            all_prompt.append(prompts)
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
-                    text_features.append(clip_model.encode_text(prompts_tokenized)) 
+                    text_features.append(clip_model.encode_text(prompts)) 
                     
         self.all_prompt = torch.cat(all_prompt)
 
@@ -178,33 +161,36 @@ class CustomCLIP(nn.Module):
         self.ndisc = 51
         text_features = text_features.view(self.ndisc, -1, d)
         
-        # Anti-NaN: Safe Normalization
-        self.all_text_features_tea = F.normalize(text_features, p=2, dim=-1, eps=1e-5)
+        self.all_text_features_tea = text_features / text_features.norm(dim=-1, keepdim=True)
         text_features_mean = text_features.mean(dim=0)
-        self.text_features_tea = F.normalize(text_features_mean, p=2, dim=-1, eps=1e-5)
+        self.text_features_tea = text_features_mean / text_features_mean.norm(dim=-1, keepdim=True)
         self.text_prototypes = self.all_text_features_tea   
 
         if cfg.is_bonder:
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
+        # ---------------- HYBRID TIP-ADAPTER-F PARAMETERS ----------------
+        self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.dtype))
         self.tip_adapter = None
+        
         if cache_keys is not None:
-            print("Initializing Tip-Adapter Module...")
-            self.tip_adapter = TipAdapter(cache_keys, len(classnames), self.dtype).to(self.device)
-            self.register_buffer("cache_values", cache_values.to(self.dtype).to(self.device))
+            print("Initializing Hybrid Tip-Adapter-F with Sigmoid Gate...")
+            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))
+            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
+            self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
+            self.tip_adapter.weight = nn.Parameter(cache_keys) 
+            self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
     def forward(self, image, mask=None, labels=None):
-        # 1. GLAli Core: Teacher
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
-            image_features_tea = F.normalize(image_features_tea, p=2, dim=-1, eps=1e-5)
-            local_image_features_tea = F.normalize(local_image_features_tea, p=2, dim=-1, eps=1e-5)
+            image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
+            local_image_features_tea = local_image_features_tea / local_image_features_tea.norm(dim=-1, keepdim=True)
         
-        # 2. GLAli Core: Student
         image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
-        image_features = F.normalize(image_features, p=2, dim=-1, eps=1e-5)
-        local_image_features = F.normalize(local_image_features, p=2, dim=-1, eps=1e-5)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
 
         text_prototypes = self.text_prototypes.detach()
         n_disc, c, d = text_prototypes.shape
@@ -213,7 +199,6 @@ class CustomCLIP(nn.Module):
         l2p = None
         l2p_tea = None
         
-        # 3. GLAli Core: Bonder & LocSC Alignment
         if labels is not None and self.cfg.is_bonder:
             bs = labels.shape[0]
             l2p = text_prototypes[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
@@ -233,8 +218,7 @@ class CustomCLIP(nn.Module):
             ood_loc_feats = torch.gather(local_image_features, 1, idx_ood.unsqueeze(-1).expand(-1, -1, d))
             
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
-            text_bias = F.normalize(text_bias, p=2, dim=-1, eps=1e-5)
-            
+            text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
             alpha = self.cfg.lambda_value
             updated_proto = self.text_prototypes
             
@@ -250,55 +234,53 @@ class CustomCLIP(nn.Module):
             update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
             updated_proto = (1 - proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1 - alpha) * update_features)
 
-            updated_proto_norm = F.normalize(updated_proto, p=2, dim=-1, eps=1e-5)
+            updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = F.normalize(updated_proto_mean, p=2, dim=-1, eps=1e-5)
+            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
         else:
-            updated_proto_norm = F.normalize(self.text_prototypes, p=2, dim=-1, eps=1e-5)
+            updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = F.normalize(updated_proto_mean, p=2, dim=-1, eps=1e-5)
+            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
 
-        # Anti-NaN: Safe logit scale clamp to prevent FP16 Overflow
-        logit_scale = self.logit_scale.clamp(max=4.6051).exp()
+        logit_scale = self.logit_scale.exp()
         
-        g_weight = self.tip_adapter.global_weight if self.tip_adapter is not None else 1.0
+        g_weight = torch.clamp(self.global_weight, min=0.0, max=1.0)
         
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
-        
-        # Local Logits use the Teacher Text (Frozen) for stability
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
 
-        # ---------------- HYBRID TIP-ADAPTER ----------------
-        if self.tip_adapter is not None:
-            # TWEAK 1: Domain Drift Fix. Query using frozen teacher features
-            text_tea_frozen = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
-            sim_to_all = torch.matmul(local_image_features_tea, text_tea_frozen.T)
+        # ---------------- HYBRID TIP-ADAPTER WITH SIGMOID GATING ----------------
+        if getattr(self, "tip_adapter", None) is not None:
+            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
+            
+            # 1. Use the frozen teacher features for cache matching (Domain Drift Fix)
+            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
             lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
-            lesion_query_tea = F.normalize(lesion_patches.mean(dim=1), p=2, dim=-1, eps=1e-5)
+            lesion_query = lesion_patches.mean(dim=1)
+            lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            # TWEAK 2: Hybrid Query (Global + Lesion)
-            hybrid_query = F.normalize(image_features_tea + lesion_query_tea, p=2, dim=-1, eps=1e-5)
+            # 2. Hybrid Query (Global + Lesion)
+            hybrid_query = F.normalize(image_features_tea + lesion_query, p=2, dim=-1)
             
+            # 3. Match against Hybrid Cache
             affinity = self.tip_adapter(hybrid_query)
-            affinity = torch.clamp(affinity, max=1.0) # Prevent negative distances
+            affinity = torch.clamp(affinity, max=1.0)
             
-            # Stability: Ensure Beta stays strictly positive
-            safe_beta = torch.clamp(F.softplus(self.tip_adapter.tip_beta), min=0.0, max=20.0)
+            safe_beta = torch.clamp(F.softplus(self.tip_beta), max=10.0)
             
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # TWEAK 3: Sigmoid Gating safely cast to AMP precision
-            gate = torch.sigmoid(self.tip_adapter.tip_alpha).to(affinity.dtype)
-            
-            # Scale cache up to CLIP mathematical space, safely gated
+            # 4. Gate and Scale
+            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
+        # ------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -315,6 +297,7 @@ class LocProto(TrainerX):
 
         self.lambda_value = cfg.lambda_value
         self.top_k = cfg.topk
+        self.label =[]
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
@@ -322,8 +305,8 @@ class LocProto(TrainerX):
         if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
 
-        # ---------------- CONSTRUCT PRISTINE HYBRID CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache from training set...")
+        # ---------------- CONSTRUCT HYBRID TIP-ADAPTER CACHE ----------------
+        print("Extracting Pristine Visual Memory Cache (Hybrid Global+Lesion) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
             cfg,
@@ -342,15 +325,15 @@ class LocProto(TrainerX):
         
         with torch.no_grad():
             text_tea = clip_model.encode_text(clip.tokenize(["a photo of a " + c.replace("_", " ") for c in classnames]).to(self.device))
-            text_tea = F.normalize(text_tea, p=2, dim=-1, eps=1e-5)
+            text_tea = F.normalize(text_tea, p=2, dim=-1)
             
-            for batch in tqdm(cache_loader, desc="Building Hybrid Cache"):
+            for batch in tqdm(cache_loader, desc="Building Cache"):
                 image = batch["img"].to(self.device)
                 label = batch["label"].to(self.device)
                 
-                img_feat, local_feat, _ = clip_model.visual(image.type(clip_model.dtype))
-                img_feat = F.normalize(img_feat, p=2, dim=-1, eps=1e-5)
-                local_feat = F.normalize(local_feat, p=2, dim=-1, eps=1e-5)
+                global_feat, local_feat, _ = clip_model.visual(image.type(clip_model.dtype))
+                global_feat = F.normalize(global_feat, p=2, dim=-1)
+                local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
                 gt_text = text_tea[label].unsqueeze(1) 
                 sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1)
@@ -358,29 +341,40 @@ class LocProto(TrainerX):
                 
                 d_dim = local_feat.shape[-1]
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
-                lesion_feat_mean = F.normalize(lesion_feats.mean(dim=1), p=2, dim=-1, eps=1e-5)
                 
-                # TWEAK 2: Hybrid Cache Key Storage (Global + Lesion)
-                hybrid_key = F.normalize(img_feat + lesion_feat_mean, p=2, dim=-1, eps=1e-5)
+                lesion_feat_mean = lesion_feats.mean(dim=1)
+                lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
+                
+                # Hybrid Key: Context (Global) + Specificity (Lesion)
+                hybrid_key = F.normalize(global_feat + lesion_feat_mean, p=2, dim=-1)
                 
                 cache_keys.append(hybrid_key.cpu())
                 cache_labels.append(label.cpu())
                 
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
 
-        print("Building Custom CLIP...")
+        print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=cache_keys, cache_values=cache_values)
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter")
+        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys & Gates")
         for name, param in self.model.named_parameters():
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
-                'tip_adapter' in name):
+                'tip_adapter' in name or 
+                'tip_alpha' in name or 
+                'tip_beta' in name or 
+                'global_weight' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
+
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
 
         self.model.to(self.device)
         
@@ -396,13 +390,21 @@ class LocProto(TrainerX):
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
+            # ---------------- FIX: EXACT ADAMW TIP-ADAPTER OPTIMIZER ----------------
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
-                # TWEAK 3: Hardcoded AdamW explicitly requested for Cache components
-                self.optim_tip = torch.optim.AdamW(self.model.tip_adapter.parameters(), lr=0.001, weight_decay=1e-4)
-                # Rely on Dassl's LR scheduler wrapper built atop our hardcoded AdamW
-                cfg_tip_sched = deepcopy(cfg.OPTIM)
-                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg_tip_sched)
+                tip_params =[
+                    self.model.tip_adapter.weight, 
+                    self.model.tip_alpha, 
+                    self.model.tip_beta, 
+                    self.model.global_weight
+                ]
+                
+                # Demand 3: Hardcode AdamW + LR 0.001
+                self.optim_tip = torch.optim.AdamW(tip_params, lr=0.001, weight_decay=1e-4)
+                self.sched_tip = torch.optim.lr_scheduler.CosineAnnealingLR(self.optim_tip, float(cfg.OPTIM.MAX_EPOCH))
+                
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
+            # ------------------------------------------------------------------------
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
 
@@ -410,31 +412,8 @@ class LocProto(TrainerX):
         if device_count > 1:
             self.model = nn.DataParallel(self.model)
 
-    def parse_batch_train(self, batch):
-        """ BULLETPROOF FIX: Safely unpack training batches irrespective of Dassl augmentations. """
-        input = batch["img"]
-        label = batch["label"]
-        if isinstance(input, list):
-            input = input[0]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
-
-    def parse_batch_test(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-        if isinstance(input, list):
-            input = input[0]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
-
     def forward_backward(self, batch):
-        # Immune to Unpacking Errors
-        parsed = self.parse_batch_train(batch)
-        image = parsed[0]
-        label = parsed[1]
-        
+        image, label = self.parse_batch_train(batch)
         prec = self.cfg.TRAINER.LOCOOP.PREC
 
         if prec == "amp":
@@ -444,23 +423,11 @@ class LocProto(TrainerX):
                 
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
-                
-                # GLAli Core: Distillation constraints
                 loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
-                
-                loss_supc = 0.0
-                if id_loc_feats is not None and ood_loc_feats is not None:
-                    loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
+                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
-
-            # Safety trigger to prevent NaN cascade
-            if not torch.isfinite(loss):
-                for name in self._optims:
-                    if self._optims[name] is not None:
-                        self._optims[name].zero_grad()
-                return {"loss": 0.0, "acc": 0.0}
 
             for name in self._optims:
                 if self._optims[name] is not None:
@@ -471,6 +438,7 @@ class LocProto(TrainerX):
             for name in self._optims:
                 if self._optims[name] is not None:
                     self.scaler.step(self._optims[name])
+                    
             self.scaler.update()
         else:
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
@@ -480,18 +448,9 @@ class LocProto(TrainerX):
             loss_id2 = F.cross_entropy(output_local, label)
             loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
-            
-            loss_supc = 0.0
-            if id_loc_feats is not None and ood_loc_feats is not None:
-                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
+            loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
             loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
-
-            if not torch.isfinite(loss):
-                for name in self._optims:
-                    if self._optims[name] is not None:
-                        self._optims[name].zero_grad()
-                return {"loss": 0.0, "acc": 0.0}
 
             for name in self._optims:
                 if self._optims[name] is not None:
@@ -516,6 +475,13 @@ class LocProto(TrainerX):
 
         self.model.text_prototypes = text_stu.detach()
         return loss_summary
+
+    def parse_batch_train(self, batch):
+        input = batch["img"]
+        label = batch["label"]
+        input = input.to(self.device)
+        label = label.to(self.device)
+        return input, label
 
     def load_model(self, directory, epoch=None):
         if not directory:
@@ -556,9 +522,7 @@ class LocProto(TrainerX):
             self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
             
         for batch_idx, batch in enumerate(tqdm(data_loader)):
-            parsed = self.parse_batch_test(batch)
-            input = parsed[0]
-            label = parsed[1]
+            input, label = self.parse_batch_test(batch)
             output = self.model_inference(input)
             if len(output) >= 2:
                 if self.cfg.is_bonder:
@@ -589,9 +553,7 @@ class LocProto(TrainerX):
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             (images, labels, *id_flag) = batch
             if isinstance(images, str):
-                parsed = self.parse_batch_test(batch)
-                images = parsed[0]
-                label = parsed[1]
+                images, label = self.parse_batch_test(batch)
             else:
                 images = images.cuda()
             
@@ -610,7 +572,16 @@ class LocProto(TrainerX):
 
     def model_inference(self, input):
         return self.model(input)
-        
+
+    def parse_batch_test(self, batch):
+        input = batch["img"]
+        label = batch["label"]
+
+        input = input.to(self.device)
+        label = label.to(self.device)
+
+        return input, label
+
     @torch.no_grad()
     def test_visualize(self, img_path, label_idx):
         """
