@@ -225,12 +225,11 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
 
-        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
+        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
+            # Query space matches Cache space (Teacher Features)
+            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
             
-            # FIX 1: Use local_image_features_tea (from the frozen zs_img_encoder)
-            # This ensures the query space EXACTLY matches the cache_keys space!
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
@@ -241,16 +240,23 @@ class CustomCLIP(nn.Module):
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
             affinity = self.tip_adapter(lesion_query)
-            
             affinity = torch.clamp(affinity, max=1.0)
-            cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
+            # TWEAK 3: Removed max=10.0 clamp. Math is naturally bounded between 0 and 1. Let it be sharp!
+            safe_beta = F.softplus(self.tip_beta)
+            
+            # DTYPE FIX: Cast cache_values to exactly match affinity's current AMP dtype
+            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            
+            # SIGMOID GATE: Dtype safe
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
+            
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # FIX 3: Only add to the final logits. Do not corrupt logits_local.
+            # TWEAK: ONLY add to the total logits! Keep logits_local pure so the Vision Encoder actually learns!
             logits = logits + scaled_cache_logits
-        # -------------------------------------------------------------------
+            # logits_local remains untouched
+        # -----------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -325,23 +331,31 @@ class LocProto(TrainerX):
                 cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
                 
-        cache_keys = torch.cat(cache_keys, dim=0).to(self.device) 
+        # DTYPE FIX: Cast to match clip_model.dtype perfectly
+        cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
+        # ----------------------------------------------------------------------------------
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
-        self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
+        print("Building custom CLIP")
+        self.model = CustomCLIP(cfg, classnames, clip_model)
+        # Move model to device BEFORE assigning parameters to avoid device mismatch
+        self.model.to(self.device)
+
+        print("Injecting Lesion-Only Cache into Tip-Adapter with Learnable Gating...")
+        # TWEAK 2: Start alpha slightly negative (sigmoid(-1) ≈ 0.26) so it doesn't overwhelm the network early
+        self.model.tip_alpha = nn.Parameter(torch.full((1, len(classnames)), -1.0, dtype=self.model.dtype, device=self.device))  
         
-        # TWEAK 3 FIX: Must be nn.Parameter Tensors, not plain floats!
+        # TWEAK 3: Start beta at 5.5, and global_weight at 0.1 (Matches pure GLAli exactly!)
         self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
-        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        self.model.global_weight = nn.Parameter(torch.tensor(0.1, dtype=self.model.dtype, device=self.device))
         
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.model.register_buffer("cache_values", cache_values)
         # -------------------------------------------------------------------------
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
+        print("Configuring Gradients: Vision Attention + Bonder + Tip-Adapter Keys & Gates")
         for name, param in self.model.named_parameters():
             if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
                 param.requires_grad_(True)
