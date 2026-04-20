@@ -75,7 +75,7 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     
     bias_logits = torch.sum(mat, dim=(-2, -1))
     
-    # Applied Global Weight to the base logits to balance semantic pull
+    # TWEAK 3: Dynamic Global Weight applied to base logits
     logits = (global_weight * base_logits) + bias_logits
     return logits
 
@@ -115,12 +115,13 @@ class TextEncoder(nn.Module):
 
 class TipAdapter(nn.Module):
     """
-    Tweak 3: Encapsulates Tip-Adapter Parameters for clean AdamW optimization.
+    TWEAK 3: Encapsulates all Tip-Adapter parameters (Keys, Alpha Gate, Beta, Global Weight)
+    so they can be cleanly passed to AdamW.
     """
     def __init__(self, cache_keys, n_cls, dtype):
         super().__init__()
         self.weight = nn.Parameter(cache_keys)
-        # Tweak 3: Sigmoid gate alpha, tip beta, and global weight are parameters
+        # Learnable class-specific sigmoid gate (starts at 0.0 -> Sigmoid(0) = 0.5)
         self.tip_alpha = nn.Parameter(torch.zeros(1, n_cls, dtype=dtype))
         self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=dtype))
         self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=dtype))
@@ -144,12 +145,13 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        self.image_features_store =[]
         self.cfg = cfg
 
         description_file = os.path.join('./description', f'{cfg.DATASET.NAME}.json')
         print(f'Using description file: {description_file}')
         llm_descriptions = json.load(open(description_file))
-        text_features = []
+        text_features =[]
         template = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         all_prompt =[]
         print(classnames)
@@ -193,13 +195,13 @@ class CustomCLIP(nn.Module):
             self.register_buffer("cache_values", cache_values.to(self.dtype).to(self.device))
 
     def forward(self, image, mask=None, labels=None):
-        # GLAli Core: Teacher
+        # 1. GLAli Core: Teacher
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
             image_features_tea = F.normalize(image_features_tea, p=2, dim=-1, eps=1e-5)
             local_image_features_tea = F.normalize(local_image_features_tea, p=2, dim=-1, eps=1e-5)
         
-        # GLAli Core: Student
+        # 2. GLAli Core: Student
         image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
         image_features = F.normalize(image_features, p=2, dim=-1, eps=1e-5)
         local_image_features = F.normalize(local_image_features, p=2, dim=-1, eps=1e-5)
@@ -211,7 +213,7 @@ class CustomCLIP(nn.Module):
         l2p = None
         l2p_tea = None
         
-        # GLAli Core: Bonder & LocSC Alignment
+        # 3. GLAli Core: Bonder & LocSC Alignment
         if labels is not None and self.cfg.is_bonder:
             bs = labels.shape[0]
             l2p = text_prototypes[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
@@ -284,12 +286,12 @@ class CustomCLIP(nn.Module):
             affinity = self.tip_adapter(hybrid_query)
             affinity = torch.clamp(affinity, max=1.0) # Prevent negative distances
             
-            # Safe beta exponent
+            # Stability: Ensure Beta stays strictly positive
             safe_beta = torch.clamp(F.softplus(self.tip_adapter.tip_beta), min=0.0, max=20.0)
             
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # TWEAK 3: Sigmoid Gating safely mapped to AMP precision
+            # TWEAK 3: Sigmoid Gating safely cast to AMP precision
             gate = torch.sigmoid(self.tip_adapter.tip_alpha).to(affinity.dtype)
             
             # Scale cache up to CLIP mathematical space, safely gated
@@ -305,7 +307,7 @@ class CustomCLIP(nn.Module):
 class LocProto(TrainerX):
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.LOCOOP.PREC in["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.LOCOOP.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -320,8 +322,8 @@ class LocProto(TrainerX):
         if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
 
-        # ---------------- TWEAK 2: CONSTRUCT HYBRID CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache (Hybrid) from training set...")
+        # ---------------- CONSTRUCT PRISTINE HYBRID CACHE ----------------
+        print("Extracting Pristine Visual Memory Cache from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
             cfg,
@@ -339,7 +341,6 @@ class LocProto(TrainerX):
         cache_labels =[]
         
         with torch.no_grad():
-            # Get text features explicitly to find lesion patches
             text_tea = clip_model.encode_text(clip.tokenize(["a photo of a " + c.replace("_", " ") for c in classnames]).to(self.device))
             text_tea = F.normalize(text_tea, p=2, dim=-1, eps=1e-5)
             
@@ -359,7 +360,7 @@ class LocProto(TrainerX):
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
                 lesion_feat_mean = F.normalize(lesion_feats.mean(dim=1), p=2, dim=-1, eps=1e-5)
                 
-                # Hybrid Key: Global + Lesion
+                # TWEAK 2: Hybrid Cache Key Storage (Global + Lesion)
                 hybrid_key = F.normalize(img_feat + lesion_feat_mean, p=2, dim=-1, eps=1e-5)
                 
                 cache_keys.append(hybrid_key.cpu())
@@ -384,37 +385,56 @@ class LocProto(TrainerX):
         self.model.to(self.device)
         
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
-            # Safe Learning Rate for Vision Encoder to prevent exploding loss_id
-            cfg_vision = deepcopy(cfg.OPTIM)
-            cfg_vision.LR = 1e-4 
-            
-            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg_vision)
-            self.sched = build_lr_scheduler(self.optim, cfg_vision)
+            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
+            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
             self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
             
             if cfg.is_bonder:
-                cfg_bonder = deepcopy(cfg.OPTIM)
-                cfg_bonder.LR = 1e-4
-                self.optim2 = build_optimizer(self.model.bonder, cfg_bonder)
-                self.sched2 = build_lr_scheduler(self.optim2, cfg_bonder)
+                cfg.OPTIM2 = deepcopy(cfg.OPTIM)
+                cfg.OPTIM2.LR = cfg.OPTIM.LR
+                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM2)
+                self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            # TWEAK 3: Hardcoded AdamW explicitly for Cache components
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
+                # TWEAK 3: Hardcoded AdamW explicitly requested for Cache components
                 self.optim_tip = torch.optim.AdamW(self.model.tip_adapter.parameters(), lr=0.001, weight_decay=1e-4)
-                cfg_tip = deepcopy(cfg.OPTIM)
-                cfg_tip.LR = 0.001
-                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg_tip)
+                # Rely on Dassl's LR scheduler wrapper built atop our hardcoded AdamW
+                cfg_tip_sched = deepcopy(cfg.OPTIM)
+                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg_tip_sched)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
-        
+
         device_count = torch.cuda.device_count()
         if device_count > 1:
             self.model = nn.DataParallel(self.model)
 
+    def parse_batch_train(self, batch):
+        """ BULLETPROOF FIX: Safely unpack training batches irrespective of Dassl augmentations. """
+        input = batch["img"]
+        label = batch["label"]
+        if isinstance(input, list):
+            input = input[0]
+        input = input.to(self.device)
+        label = label.to(self.device)
+        return input, label
+
+    def parse_batch_test(self, batch):
+        input = batch["img"]
+        label = batch["label"]
+        if isinstance(input, list):
+            input = input[0]
+        input = input.to(self.device)
+        label = label.to(self.device)
+        return input, label
+
     def forward_backward(self, batch):
-        image, label = self.parse_batch_train(batch)
+        # Immune to Unpacking Errors
+        parsed = self.parse_batch_train(batch)
+        image = parsed[0]
+        label = parsed[1]
+        
         prec = self.cfg.TRAINER.LOCOOP.PREC
 
         if prec == "amp":
@@ -422,16 +442,16 @@ class LocProto(TrainerX):
                 output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
                 all_text_features_tea = self.model.all_text_features_tea.clone()
                 
-                # Anti-NaN: Safe casting to float32 for CrossEntropy
-                loss_id = F.cross_entropy(output.float(), label)
-                loss_id2 = F.cross_entropy(output_local.float(), label)
+                loss_id = F.cross_entropy(output, label)
+                loss_id2 = F.cross_entropy(output_local, label)
                 
-                # GLAli Core: Distillation
-                loss_distil_img = F.l1_loss(img_feat_tea.float(), img_feat_stu.float(), reduction='mean') * 10.0
-                loss_distil_text = F.l1_loss(all_text_features_tea.float(), text_stu.float(), reduction='mean') * 25.0
+                # GLAli Core: Distillation constraints
+                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 
-                # GLAli Core: SupConLoss
-                loss_supc = get_supc_loss(img_feat_stu.float(), id_loc_feats.float(), ood_loc_feats.float(), l2p, l2p_tea, label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
+                loss_supc = 0.0
+                if id_loc_feats is not None and ood_loc_feats is not None:
+                    loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
                 
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
@@ -446,6 +466,151 @@ class LocProto(TrainerX):
                 if self._optims[name] is not None:
                     self._optims[name].zero_grad()
                     
+            self.scaler.scale(loss).backward()
+            
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self.scaler.step(self._optims[name])
+            self.scaler.update()
+        else:
+            output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
+            all_text_features_tea = self.model.all_text_features_tea.clone()
+            
+            loss_id = F.cross_entropy(output, label)
+            loss_id2 = F.cross_entropy(output_local, label)
+            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+            loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
+            
+            loss_supc = 0.0
+            if id_loc_feats is not None and ood_loc_feats is not None:
+                loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, n_class=self.model.n_cls, topk=self.top_k) * 0.5
+            
+            loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+
+            if not torch.isfinite(loss):
+                for name in self._optims:
+                    if self._optims[name] is not None:
+                        self._optims[name].zero_grad()
+                return {"loss": 0.0, "acc": 0.0}
+
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self._optims[name].zero_grad()
+                    
+            loss.backward()
+            
+            for name in self._optims:
+                if self._optims[name] is not None:
+                    self._optims[name].step()
+
+        loss_summary = {
+            "loss": loss.item(),
+            "loss_id": loss_id.item(),
+            "loss_distil_img": loss_distil_img.item(),
+            "loss_distil_text": loss_distil_text.item(),
+            "acc": compute_accuracy(output, label)[0].item(),
+        }
+
+        if (self.batch_idx + 1) == self.num_batches:
+            self.update_lr()
+
+        self.model.text_prototypes = text_stu.detach()
+        return loss_summary
+
+    def load_model(self, directory, epoch=None):
+        if not directory:
+            return
+
+        names = self.get_model_names()
+        model_file = "model-best.pth.tar" if epoch is None else f"model.pth.tar-{epoch}"
+
+        for name in names:
+            model_path = osp.join(directory, name, model_file)
+            if not osp.exists(model_path):
+                raise FileNotFoundError(f'Model not found at "{model_path}"')
+
+            checkpoint = load_checkpoint(model_path)
+            state_dict = checkpoint["state_dict"]
+
+            keys_to_delete =[k for k in state_dict.keys() if "token_prefix" in k or "token_suffix" in k]
+            for k in keys_to_delete:
+                del state_dict[k]
+
+            print(f'Loading weights to {name} from "{model_path}"')
+            self._models[name].load_state_dict(state_dict, strict=False)
+
+    @torch.no_grad()
+    def test(self, split=None):
+        self.model.image_features_store =[]
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
+
+        print(f"Evaluate on the *{split}* set")
+
+        if self.cfg.is_bonder:
+            self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
+            
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            parsed = self.parse_batch_test(batch)
+            input = parsed[0]
+            label = parsed[1]
+            output = self.model_inference(input)
+            if len(output) >= 2:
+                if self.cfg.is_bonder:
+                    output = output[1] + 0.05 * output[0]
+                else:
+                    output = output[0]
+            self.label.append(label)
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        for k, v in results.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        return list(results.values())[0]
+
+    @torch.no_grad()
+    def test_ood(self, data_loader, T):
+        self.model.image_features_store =[]
+        to_np = lambda x: x.data.cpu().numpy()
+        concat = lambda x: np.concatenate(x, axis=0)
+
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        mcm_score =[]
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            (images, labels, *id_flag) = batch
+            if isinstance(images, str):
+                parsed = self.parse_batch_test(batch)
+                images = parsed[0]
+                label = parsed[1]
+            else:
+                images = images.cuda()
+            
+            output, output_local, _, _, _, _, _, _, _ = self.model_inference(images)
+            
+            if self.cfg.is_bonder:
+                output = output_local + 0.05 * output
+                
+            output /= 100.0
+            smax_global = to_np(F.softmax(output/T, dim=-1))  
+            mcm_global_score = -np.max(smax_global, axis=1)
+            mcm_score.append(mcm_global_score)
+
+        res = concat(mcm_score)[:len(data_loader.dataset)].copy()
+        return res, res, res, res
+
+    def model_inference(self, input):
+        return self.model(input)
+        
     @torch.no_grad()
     def test_visualize(self, img_path, label_idx):
         """
