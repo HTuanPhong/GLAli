@@ -222,12 +222,14 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        # Safe Global Weight
+        g_weight = torch.clamp(self.global_weight, min=0.0, max=1.0)
+        
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)      
 
-        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
+        # ---------------- SAFE LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            # Query space matches Cache space (Teacher Features)
             text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
             
             sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
@@ -242,21 +244,17 @@ class CustomCLIP(nn.Module):
             affinity = self.tip_adapter(lesion_query)
             affinity = torch.clamp(affinity, max=1.0)
             
-            # TWEAK 3: Removed max=10.0 clamp. Math is naturally bounded between 0 and 1. Let it be sharp!
-            safe_beta = F.softplus(self.tip_beta)
+            # FIXED: Beta is strictly frozen at 5.5 to preserve OOD Rejection!
+            cache_logits = torch.exp(-5.5 * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # DTYPE FIX: Cast cache_values to exactly match affinity's current AMP dtype
-            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
-            
-            # SIGMOID GATE: Dtype safe
+            # SIGMOID GATE: Single scalar gate for universal balance
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
             
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # TWEAK: ONLY add to the total logits! Keep logits_local pure so the Vision Encoder actually learns!
+            # Add to total logits only (preserve Vision Encoder learning)
             logits = logits + scaled_cache_logits
-            # logits_local remains untouched
-        # -----------------------------------------------------------------------------
+        # ----------------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -334,70 +332,59 @@ class LocProto(TrainerX):
         # DTYPE FIX: Cast to match clip_model.dtype perfectly
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
-        # ----------------------------------------------------------------------------------
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
-        # Move model to device BEFORE assigning parameters to avoid device mismatch
         self.model.to(self.device)
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter with Learnable Gating...")
-        # TWEAK 2: Start alpha slightly negative (sigmoid(-1) ≈ 0.26) so it doesn't overwhelm the network early
-        self.model.tip_alpha = nn.Parameter(torch.full((1, len(classnames)), -1.0, dtype=self.model.dtype, device=self.device))  
+        print("Injecting Lesion-Only Cache into Tip-Adapter with Scalar Sigmoid Gate...")
+        # 1. Scalar Gate initialized to 0.0 (sigmoid(0) = 0.5)
+        self.model.tip_alpha = nn.Parameter(torch.tensor(0.0, dtype=self.model.dtype, device=self.device))  
         
-        # TWEAK 3: Start beta at 5.5, and global_weight at 0.1 (Matches pure GLAli exactly!)
-        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
+        # 2. Learnable Global Weight initialized to 0.1
         self.model.global_weight = nn.Parameter(torch.tensor(0.1, dtype=self.model.dtype, device=self.device))
         
+        # 3. FROZEN CACHE (Tip-Adapter instead of Tip-Adapter-F)
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
-        self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
-        self.model.register_buffer("cache_values", cache_values)
+        self.model.tip_adapter.weight = nn.Parameter(cache_keys)
+        self.model.tip_adapter.weight.requires_grad_(False) # <--- THIS IS THE KEY FIX
+        
+        self.model.register_buffer("cache_values", cache_values.to(self.model.dtype))
         # -------------------------------------------------------------------------
 
-        print("Configuring Gradients: Vision Attention + Bonder + Tip-Adapter Keys & Gates")
+        print("Configuring Gradients: Vision Attention + Bonder + Gates")
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
+            if ('image_encoder.transformer.resblocks.11.attn' in name or 
+                'bonder' in name or 
+                'tip_alpha' in name or 
+                'global_weight' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
 
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
+
         self.model.to(self.device)
         
-        if "ViT" in cfg.MODEL.BACKBONE.NAME:
-            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
-            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-            self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
-            
-            if cfg.is_bonder:
-                cfg.OPTIM2 = deepcopy(cfg.OPTIM)
-                cfg.OPTIM2.LR = cfg.OPTIM.LR
-                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM2)
-                self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
-                self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
-
-            # ---------------- FIX 3: CORRECT TIP-ADAPTER OPTIMIZER ----------------
-            if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
-                cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
-                cfg.OPTIM_TIP.LR = 0.001
-                
-                # Pass all 4 learnable Tip-Adapter components to the optimizer
-                tip_params =[
-                    self.model.tip_adapter.weight, 
-                    self.model.tip_alpha,
-                    self.model.tip_beta,
-                    self.model.global_weight
-                ]
-                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
-                
-                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
-                self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ----------------------------------------------------------------------
-
+        # ---------------- UNIFIED OPTIMIZER ----------------
+        # One single optimizer handles Attention, Bonder, tip_alpha, and global_weight.
+        # This prevents crash bugs and syncs the learning perfectly.
+        trainable_params =[p for p in self.model.parameters() if p.requires_grad]
+        self.optim = build_optimizer(trainable_params, cfg.OPTIM)
+        self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        
+        self.register_model("model", self.model, self.optim, self.sched)
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
+        # ---------------------------------------------------
 
         device_count = torch.cuda.device_count()
         if device_count > 1:
+            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
