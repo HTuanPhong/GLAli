@@ -43,7 +43,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
     base_logits = image_features @ mean_text_features.T   
     image_features = image_features.unsqueeze(1)  
     all_image_features = local_image_features
@@ -63,7 +63,9 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    logits = base_logits + bias_logits
+    
+    # EXACT FIX: The function now accepts global_weight and properly scales the base (global) logits
+    logits = (global_weight * base_logits) + bias_logits
     return logits
 
 
