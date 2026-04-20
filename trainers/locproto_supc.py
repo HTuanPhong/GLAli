@@ -115,13 +115,13 @@ class TextEncoder(nn.Module):
 
 class TipAdapter(nn.Module):
     """
-    Encapsulates all Tip-Adapter parameters (Keys, Alpha Gate, Beta, Global Weight)
-    so they can be cleanly passed to AdamW and safely checkpointed.
+    TWEAK 3: Encapsulates all Tip-Adapter parameters (Keys, Alpha Gate, Beta, Global Weight)
+    so they can be cleanly passed to AdamW.
     """
     def __init__(self, cache_keys, n_cls, dtype):
         super().__init__()
-        # TWEAK 3: Initialization of Learnable Magic Numbers
         self.weight = nn.Parameter(cache_keys)
+        # Learnable class-specific sigmoid gate (starts at 0.0 -> Sigmoid(0) = 0.5)
         self.tip_alpha = nn.Parameter(torch.zeros(1, n_cls, dtype=dtype))
         self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=dtype))
         self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=dtype))
@@ -131,7 +131,7 @@ class TipAdapter(nn.Module):
 
 
 class CustomCLIP(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
+    def __init__(self, cfg, classnames, clip_model, cache_keys=None, cache_values=None):
         super().__init__()
         self.device = torch.device("cuda")
         clip_model.to(self.device)
@@ -146,7 +146,7 @@ class CustomCLIP(nn.Module):
         description_file = os.path.join('./description', f'{cfg.DATASET.NAME}.json')
         print(f'Using description file: {description_file}')
         llm_descriptions = json.load(open(description_file))
-        text_features =[]
+        text_features = []
         template = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         all_prompt =[]
         print(classnames)
@@ -173,7 +173,7 @@ class CustomCLIP(nn.Module):
         self.ndisc = 51
         text_features = text_features.view(self.ndisc, -1, d)
         
-        # STABILITY FIX: Use F.normalize with eps to prevent division by zero NaNs
+        # Stability Fix: F.normalize with eps
         self.all_text_features_tea = F.normalize(text_features, p=2, dim=-1, eps=1e-5)
         text_features_mean = text_features.mean(dim=0)
         self.text_features_tea = F.normalize(text_features_mean, p=2, dim=-1, eps=1e-5)
@@ -183,16 +183,20 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        # Will be initialized by LocProto
         self.tip_adapter = None
+        if cache_keys is not None:
+            print("Initializing Hybrid Cache Parameters in Tip-Adapter...")
+            self.tip_adapter = TipAdapter(cache_keys, len(classnames), self.dtype).to(self.device)
+            self.register_buffer("cache_values", cache_values.to(self.dtype).to(self.device))
 
     def forward(self, image, mask=None, labels=None):
+        # 1. GLAli Frozen Teacher Extraction
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
-            # STABILITY FIX
             image_features_tea = F.normalize(image_features_tea, p=2, dim=-1, eps=1e-5)
             local_image_features_tea = F.normalize(local_image_features_tea, p=2, dim=-1, eps=1e-5)
         
+        # 2. GLAli Student Encoder
         image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
         image_features = F.normalize(image_features, p=2, dim=-1, eps=1e-5)
         local_image_features = F.normalize(local_image_features, p=2, dim=-1, eps=1e-5)
@@ -204,6 +208,7 @@ class CustomCLIP(nn.Module):
         l2p = None
         l2p_tea = None
         
+        # 3. GLAli Bonder (Text Refinement) & LocSC Setup
         if labels is not None and self.cfg.is_bonder:
             bs = labels.shape[0]
             l2p = text_prototypes[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
@@ -248,18 +253,21 @@ class CustomCLIP(nn.Module):
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = F.normalize(updated_proto_mean, p=2, dim=-1, eps=1e-5)
 
-        # STABILITY FIX: Clamp logit_scale to avoid Inf/NaN explosion during `.exp()`
+        # Stability Fix: Clamp logit_scale to strictly prevent Inf / NaN in CrossEntropy
         logit_scale = self.logit_scale.clamp(max=4.6051).exp()
         
         g_weight = self.tip_adapter.global_weight if self.tip_adapter is not None else 1.0
         
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=g_weight)
+        
+        # Local Logits use the Teacher Text (Frozen) for stability
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=g_weight)
 
+        # ---------------- TIP-ADAPTER-F TWEAK 1 & 2 ----------------
         if self.tip_adapter is not None:
-            # TWEAK 1: Domain Drift Fix. Query cache using FROZEN teacher features
-            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
-            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
+            # TWEAK 1: Domain Drift Fix. Query using frozen teacher
+            text_tea_frozen = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
+            sim_to_all = torch.matmul(local_image_features_tea, text_tea_frozen.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
@@ -267,19 +275,23 @@ class CustomCLIP(nn.Module):
             lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query_tea = F.normalize(lesion_patches.mean(dim=1), p=2, dim=-1, eps=1e-5)
             
-            # TWEAK 2: Hybrid Query (Global + Lesion) for optimal cache retrieval
+            # TWEAK 2: Hybrid Query (Global + Lesion)
             hybrid_query = F.normalize(image_features_tea + lesion_query_tea, p=2, dim=-1, eps=1e-5)
             
             affinity = self.tip_adapter(hybrid_query)
+            
+            # Stability: Prevent negative distance crash
             affinity = torch.clamp(affinity, max=1.0)
             
-            safe_beta = F.softplus(self.tip_adapter.tip_beta)
+            # Stability: Ensure Beta stays strictly positive
+            safe_beta = torch.clamp(F.softplus(self.tip_adapter.tip_beta), min=0.0, max=20.0)
+            
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # TWEAK 3: Sigmoid Gating bounded between 0.0 and 1.0
+            # TWEAK 3: Sigmoid Gating safely cast to AMP precision
             gate = torch.sigmoid(self.tip_adapter.tip_alpha).to(affinity.dtype)
             
-            # Scale up to CLIP mathematical space, safely gated
+            # Scale to CLIP space, then apply the gate
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
             logits = logits + scaled_cache_logits
@@ -292,7 +304,7 @@ class CustomCLIP(nn.Module):
 class LocProto(TrainerX):
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.LOCOOP.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.LOCOOP.PREC in["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -300,17 +312,12 @@ class LocProto(TrainerX):
 
         self.lambda_value = cfg.lambda_value
         self.top_k = cfg.topk
-        self.label =[]
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
+        if cfg.TRAINER.LOCOOP.PREC in["fp32", "amp"]:
             clip_model.float()
-
-        print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model)
-        self.model.to(self.device)
 
         # ---------------- CONSTRUCT PRISTINE HYBRID CACHE ----------------
         print("Extracting Pristine Visual Memory Cache from training set...")
@@ -324,18 +331,21 @@ class LocProto(TrainerX):
             is_train=False
         )
 
-        self.model.eval()
+        clip_model.to(self.device)
+        clip_model.eval()
+        
         cache_keys =[]
         cache_labels =[]
         
         with torch.no_grad():
-            text_tea = self.model.text_features_tea.to(self.device)
+            text_tea = clip_model.encode_text(clip.tokenize(["a photo of a " + c.replace("_", " ") for c in classnames]).to(self.device))
+            text_tea = F.normalize(text_tea, p=2, dim=-1, eps=1e-5)
             
-            for batch in tqdm(cache_loader, desc="Building Cache"):
+            for batch in tqdm(cache_loader, desc="Building Hybrid Cache"):
                 image = batch["img"].to(self.device)
                 label = batch["label"].to(self.device)
                 
-                img_feat, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
+                img_feat, local_feat, _ = clip_model.visual(image.type(clip_model.dtype))
                 img_feat = F.normalize(img_feat, p=2, dim=-1, eps=1e-5)
                 local_feat = F.normalize(local_feat, p=2, dim=-1, eps=1e-5)
                 
@@ -353,14 +363,12 @@ class LocProto(TrainerX):
                 cache_keys.append(hybrid_key.cpu())
                 cache_labels.append(label.cpu())
                 
-        cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(self.model.dtype) 
+        cache_keys = torch.cat(cache_keys, dim=0).to(self.device).to(clip_model.dtype) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(self.model.dtype) 
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(self.device).to(clip_model.dtype) 
 
-        print("Injecting Hybrid Cache into Tip-Adapter with Learnable Sigmoid Gate...")
-        # Inject the encapsulated module (Tweak 3)
-        self.model.tip_adapter = TipAdapter(cache_keys, len(classnames), self.model.dtype).to(self.device)
-        self.model.register_buffer("cache_values", cache_values)
+        print("Building Custom CLIP...")
+        self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=cache_keys, cache_values=cache_values)
 
         print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys & Gates")
         for name, param in self.model.named_parameters():
@@ -385,10 +393,9 @@ class LocProto(TrainerX):
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
-                # TWEAK 3: Hardcoded AdamW explicitly requested for Cache components
+            if getattr(self.model, "tip_adapter", None) is not None:
+                # TWEAK 3: Hardcoded AdamW exclusively for the Tip-Adapter
                 self.optim_tip = torch.optim.AdamW(self.model.tip_adapter.parameters(), lr=0.001, weight_decay=1e-4)
-                # Rely on Dassl's LR scheduler wrapper built atop our hardcoded AdamW
                 cfg_tip_sched = deepcopy(cfg.OPTIM)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg_tip_sched)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
@@ -411,14 +418,22 @@ class LocProto(TrainerX):
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
                 
-                # GLAli Core: Distillation constraints
+                # GLAli Core: Distillation
                 loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 
-                # GLAli Core: Supervised Local Contrastive
+                # GLAli Core: LocSC
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+
+            # Check for NaNs safely
+            if not torch.isfinite(loss):
+                print(f"Skipping bad batch. Loss: {loss.item()}")
+                for name in self._optims:
+                    if self._optims[name] is not None:
+                        self._optims[name].zero_grad()
+                return {"loss": 0.0, "acc": 0.0}
 
             for name in self._optims:
                 if self._optims[name] is not None:
@@ -429,7 +444,6 @@ class LocProto(TrainerX):
             for name in self._optims:
                 if self._optims[name] is not None:
                     self.scaler.step(self._optims[name])
-                    
             self.scaler.update()
         else:
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
@@ -442,6 +456,13 @@ class LocProto(TrainerX):
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
             loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+
+            if not torch.isfinite(loss):
+                print(f"Skipping bad batch. Loss: {loss.item()}")
+                for name in self._optims:
+                    if self._optims[name] is not None:
+                        self._optims[name].zero_grad()
+                return {"loss": 0.0, "acc": 0.0}
 
             for name in self._optims:
                 if self._optims[name] is not None:
@@ -458,7 +479,7 @@ class LocProto(TrainerX):
             "loss_id": loss_id.item(),
             "loss_distil_img": loss_distil_img.item(),
             "loss_distil_text": loss_distil_text.item(),
-            "acc": compute_accuracy(output_local, label)[0].item(),
+            "acc": compute_accuracy(output, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
