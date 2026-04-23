@@ -21,7 +21,6 @@ from .zsclip_contra import entropy_select_topk2, CUSTOM_TEMPLATES
 import os
 import json
 from copy import deepcopy
-from timm.models.layers import DropPath, Mlp
 from utils.bonder import CrossAttnBlock
 from utils.loss import SupConLoss
 
@@ -172,11 +171,16 @@ class CustomCLIP(nn.Module):
         self.tip_alpha = 1.0  
         self.tip_beta = 5.5   
 
-    def inject_tip_adapter(self, cache_keys, cache_values):
+    def inject_tip_adapter(self, cache_keys, cache_values, n_cls):
         """Dynamically attach the cache after Stage 1 completes."""
         self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
         self.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.cache_values = cache_values.to(self.dtype).cuda()
+        
+        # Learnable Sigmoid Gate and Beta
+        self.tip_alpha = nn.Parameter(torch.zeros(1, n_cls, dtype=self.dtype, device=self.device))
+        self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype, device=self.device))
+        
         self.use_tip_adapter = True
 
     def forward(self, image, mask=None, labels=None, phase='glali'):
@@ -244,13 +248,11 @@ class CustomCLIP(nn.Module):
         if self.use_tip_adapter:
             bs = image.shape[0]
             if labels is not None and phase == 'tip_train':
-                # During Tip-Adapter training, strictly use ground truth to find the lesion query
                 l2p_eval = updated_proto_norm[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
                 l2p_eval = torch.transpose(l2p_eval, 0, 1)
                 sim_eval = local_image_features @ (l2p_eval.mean(dim=1, keepdim=True).transpose(1, 2))
                 sim_eval = sim_eval.squeeze(-1)
             else:
-                # During evaluation, don't know labels, so find patches with highest max similarity to any class
                 text_protos_mean = updated_proto_mean_norm 
                 sim_all = torch.matmul(local_image_features, text_protos_mean.T) 
                 sim_eval, _ = torch.max(sim_all, dim=-1) 
@@ -260,14 +262,15 @@ class CustomCLIP(nn.Module):
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            # Match lesion query against the cache
             affinity = self.tip_adapter(lesion_query)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
+            affinity = torch.clamp(affinity, max=1.0)
             
-            # Tip-Adapter's output scaled properly by logit_scale so it mathematically competes cleanly with GLAli
-            scaled_cache_logits = cache_logits * self.tip_alpha * logit_scale
+            safe_beta = F.softplus(self.tip_beta) if isinstance(self.tip_beta, torch.Tensor) else self.tip_beta
+            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # To preserve Dassl's logic flow, we embed tip_logits in a dict if training the adapter
+            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype) if isinstance(self.tip_alpha, torch.Tensor) else self.tip_alpha
+            scaled_cache_logits = (cache_logits * logit_scale) * gate
+            
             tip_logits = logits + scaled_cache_logits
             tip_logits_local = logits_local + scaled_cache_logits
             
@@ -343,14 +346,18 @@ class LocProto(TrainerX):
         print("\n" + "="*50)
         print("STAGE 1: Training Pure GLAli")
         print("="*50)
-        # THE FIX: SimpleTrainer.train() expects no arguments
-        super().train() 
+        # Call TrainerBase.train() empty parameters (SimpleTrainer handles start/max natively)
+        super().train()
         
         # --- STAGE 2: Train Local Lesion Tip-Adapter-F ---
         print("\n" + "="*50)
         print("STAGE 2: Training Local Lesion Tip-Adapter-F")
         print("="*50)
         self.train_tip_adapter()
+        
+        print("Saving final text prototypes...")
+        target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        torch.save(target_model.text_prototypes.detach().cpu(), osp.join(self.output_dir, 'proto.pth'))
         
         print("Deploying the final hybrid model")
         self.test()
@@ -404,21 +411,23 @@ class LocProto(TrainerX):
     def train_tip_adapter(self):
         target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        # Build the exact lesion memory cache using trained GLAli features
         cache_keys, cache_values = self.build_lesion_cache()
-        target_model.inject_tip_adapter(cache_keys, cache_values)
+        target_model.inject_tip_adapter(cache_keys, cache_values, len(self.dm.dataset.classnames))
         
         print("Configuring Tip-Adapter-F Optimizer...")
-        optimizer_tip = torch.optim.AdamW(target_model.tip_adapter.parameters(), lr=0.001, eps=1e-4)
+        tip_params =[
+            target_model.tip_adapter.weight,
+            target_model.tip_alpha,
+            target_model.tip_beta
+        ]
+        optimizer_tip = torch.optim.AdamW(tip_params, lr=0.001, eps=1e-4)
         
-        # Standard Tip-Adapter-F setting: train cache for 20 epochs
         train_epochs_tip = 20
         scheduler_tip = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_tip, train_epochs_tip * len(self.train_loader_x))
         scaler_tip = GradScaler() if self.cfg.TRAINER.LOCOOP.PREC == "amp" else None
         
         for epoch in range(train_epochs_tip):
             self.model.train()
-            # Hard-freeze everything in GLAli backbone
             if isinstance(self.model, nn.DataParallel):
                 self.model.module.image_encoder.eval()
                 self.model.module.text_encoder.eval()
@@ -438,7 +447,6 @@ class LocProto(TrainerX):
                 label = batch["label"].to(self.device)
                 
                 with autocast() if self.cfg.TRAINER.LOCOOP.PREC == "amp" else torch.enable_grad():
-                    # Only calculate standard cross-entropy on the new Tip-Adapter logic
                     logits_dict = self.model(image, labels=label, phase='tip_train')
                     tip_logits = logits_dict['tip_logits']
                     loss = F.cross_entropy(tip_logits, label)
@@ -461,7 +469,16 @@ class LocProto(TrainerX):
             print(f"Tip-Adapter-F Epoch {epoch+1}/{train_epochs_tip} - Loss: {losses.avg:.4f}, Acc: {accs.avg:.2f}%")
             
         print("--- Tip-Adapter-F Training Complete ---")
-        self.save_model(self.max_epoch + train_epochs_tip, self.output_dir, model_name="model-best.pth.tar")
+        
+        # Explicitly save Tip-Adapter specific state variables for evaluation!
+        tip_state = {
+            "tip_adapter.weight": target_model.tip_adapter.weight.detach().cpu(),
+            "cache_values": target_model.cache_values.detach().cpu(),
+            "tip_alpha": target_model.tip_alpha.detach().cpu(),
+            "tip_beta": target_model.tip_beta.detach().cpu()
+        }
+        torch.save(tip_state, osp.join(self.output_dir, "tip_state.pth"))
+        print(f"Saved Tip-Adapter state to {osp.join(self.output_dir, 'tip_state.pth')}")
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
@@ -539,12 +556,14 @@ class LocProto(TrainerX):
             return
 
         names = self.get_model_names()
-        model_file = "model-best.pth.tar"
+        model_file = "model-best.pth.tar" if epoch is None else f"model.pth.tar-{epoch}"
 
+        # 1. Load the base GLAli model
         for name in names:
             model_path = osp.join(directory, name, model_file)
             if not osp.exists(model_path):
-                raise FileNotFoundError(f'Model not found at "{model_path}"')
+                print(f"Warning: Model not found at {model_path}")
+                continue
 
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
@@ -552,23 +571,31 @@ class LocProto(TrainerX):
             keys_to_delete =[k for k in state_dict.keys() if "token_prefix" in k or "token_suffix" in k]
             for k in keys_to_delete:
                 del state_dict[k]
-                
-            # If the loaded state_dict has the trained tip_adapter, we must recreate it dynamically
-            # so the shapes match exactly before calling load_state_dict!
-            target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-            if "tip_adapter.weight" in state_dict:
-                shape = state_dict["tip_adapter.weight"].shape
-                target_model.tip_adapter = nn.Linear(shape[1], shape[0], bias=False).to(target_model.dtype).cuda()
-                target_model.register_buffer("cache_values", torch.zeros(shape[0], len(self.dm.dataset.classnames)).to(target_model.dtype).cuda())
 
             print(f'Loading weights to {name} from "{model_path}"')
             self._models[name].load_state_dict(state_dict, strict=False)
 
+        # ---------------- LOAD TIP-ADAPTER STATE IF EXISTS ----------------
+        tip_state_path = osp.join(directory, "tip_state.pth")
+        if osp.exists(tip_state_path):
+            print(f"Found Tip-Adapter state at {tip_state_path}. Injecting into model...")
+            tip_state = torch.load(tip_state_path, map_location="cpu")
+            target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            
+            weight = tip_state["tip_adapter.weight"]
+            target_model.tip_adapter = nn.Linear(weight.shape[1], weight.shape[0], bias=False).to(target_model.dtype).cuda()
+            target_model.tip_adapter.weight = nn.Parameter(weight.cuda())
+            target_model.cache_values = tip_state["cache_values"].cuda()
+            target_model.tip_alpha = nn.Parameter(tip_state["tip_alpha"].cuda())
+            target_model.tip_beta = nn.Parameter(tip_state["tip_beta"].cuda())
+            
+            target_model.use_tip_adapter = True
+            print("Tip-Adapter successfully restored for evaluation!")
+        # ------------------------------------------------------------------
+
     @torch.no_grad()
     def test(self, split=None):
         target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        # Turn ON tip adapter for evaluation (if it was loaded/trained)
-        target_model.use_tip_adapter = getattr(target_model, "tip_adapter", None) is not None
         
         self.model.image_features_store =[]
         self.set_model_mode("eval")
@@ -577,13 +604,24 @@ class LocProto(TrainerX):
         if split is None:
             split = self.cfg.TEST.SPLIT
 
-        data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        elif split == "test":
+            split = "test"  
+            data_loader = self.test_loader
+        else:
+            split = "train"
+            data_loader = self.train_loader_x
 
         print(f"Evaluate on the *{split}* set")
 
         if self.cfg.is_bonder:
-            self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
-            
+            proto_path = osp.join(self.output_dir, 'proto.pth')
+            if osp.exists(proto_path):
+                target_model.text_prototypes = torch.load(proto_path).to(self.device)
+            else:
+                print(f"Warning: {proto_path} not found. Using prototypes in memory.")
+                
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
             output = self.model_inference(input)
@@ -606,7 +644,6 @@ class LocProto(TrainerX):
     @torch.no_grad()
     def test_ood(self, data_loader, T):
         target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        target_model.use_tip_adapter = getattr(target_model, "tip_adapter", None) is not None
         
         self.model.image_features_store =[]
         to_np = lambda x: x.data.cpu().numpy()
@@ -614,6 +651,11 @@ class LocProto(TrainerX):
 
         self.set_model_mode("eval")
         self.evaluator.reset()
+        
+        if self.cfg.is_bonder:
+            proto_path = osp.join(self.output_dir, 'proto.pth')
+            if osp.exists(proto_path):
+                target_model.text_prototypes = torch.load(proto_path).to(self.device)
 
         mcm_score =[]
         for batch_idx, batch in enumerate(tqdm(data_loader)):
@@ -635,51 +677,3 @@ class LocProto(TrainerX):
 
         res = concat(mcm_score)[:len(data_loader.dataset)].copy()
         return res, res, res, res
-
-    def model_inference(self, input):
-        return self.model(input)
-
-    def parse_batch_test(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-
-        input = input.to(self.device)
-        label = label.to(self.device)
-
-        return input, label
-
-    @torch.no_grad()
-    def test_visualize(self, img_path, label_idx):
-        """
-        Generates a 14x14 heatmap showing which parts of the image 
-        the model used to predict the given disease label.
-        """
-        self.set_model_mode("eval")
-        
-        # 1. Use the proper test transforms
-        from dassl.data.transforms import build_transform
-        from PIL import Image
-        
-        tfm_test = build_transform(self.cfg, is_train=False)
-        image = Image.open(img_path).convert("RGB")
-        image_tensor = tfm_test(image).unsqueeze(0).to(self.device)
-        
-        # 2. Extract image patches directly from the vision encoder
-        _, local_features, _ = self.model.image_encoder(image_tensor.type(self.model.dtype))
-        local_features = local_features / local_features.norm(dim=-1, keepdim=True) # Shape: [1, 196, 512]
-        
-        # 3. Get the text prototype for the requested class
-        # text_features_tea contains the mean text embeddings for all classes [num_classes, 512]
-        target_text = self.model.text_features_tea[label_idx] 
-        
-        # 4. Compute cosine similarity between the 196 patches and the text
-        patch_scores = (local_features[0] @ target_text).float() # Shape: [196]
-        
-        # 5. Min-Max scale the scores so they look good on a heatmap (0 to 1)
-        patch_scores = patch_scores - patch_scores.min()
-        patch_scores = patch_scores / (patch_scores.max() + 1e-8)
-        
-        # 6. Reshape to a 14x14 grid
-        heatmap = patch_scores.view(14, 14).cpu().numpy()
-        
-        return heatmap, image
