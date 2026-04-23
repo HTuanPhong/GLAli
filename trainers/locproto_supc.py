@@ -343,7 +343,8 @@ class LocProto(TrainerX):
         print("\n" + "="*50)
         print("STAGE 1: Training Pure GLAli")
         print("="*50)
-        super().train(self.start_epoch, self.max_epoch)
+        # THE FIX: SimpleTrainer.train() expects no arguments
+        super().train() 
         
         # --- STAGE 2: Train Local Lesion Tip-Adapter-F ---
         print("\n" + "="*50)
