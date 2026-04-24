@@ -177,9 +177,9 @@ class CustomCLIP(nn.Module):
         self.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.cache_values = cache_values.to(self.dtype).cuda()
         
-        # EXACT Tip-Adapter constants (No Sigmoid, No Learnable Params)
-        self.tip_alpha = 1.0  
-        self.tip_beta = 5.5   
+        # Learnable Sigmoid Gate and Beta
+        self.tip_alpha = nn.Parameter(torch.zeros(1, n_cls, dtype=self.dtype, device=self.device))
+        self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype, device=self.device))
         
         self.use_tip_adapter = True
 
@@ -254,11 +254,13 @@ class CustomCLIP(nn.Module):
         if self.use_tip_adapter:
             bs = image.shape[0]
             if labels is not None and phase == 'tip_train':
+                # Use GT labels to extract lesions exactly like we did when building the cache
                 l2p_eval = updated_proto_norm[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
                 l2p_eval = torch.transpose(l2p_eval, 0, 1)
                 sim_eval = local_image_features @ (l2p_eval.mean(dim=1, keepdim=True).transpose(1, 2))
                 sim_eval = sim_eval.squeeze(-1)
             else:
+                # Inference: Blindly find the most pathological patches
                 text_protos_mean = updated_proto_mean_norm 
                 sim_all = torch.matmul(local_image_features, text_protos_mean.T) 
                 sim_eval, _ = torch.max(sim_all, dim=-1) 
@@ -268,13 +270,17 @@ class CustomCLIP(nn.Module):
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
+            # NOTE: THIS PART IS TRACKED BY AUTOGRAD DURING tip_train
             affinity = self.tip_adapter(lesion_query)
+            affinity = torch.clamp(affinity, max=1.0)
             
-            # PURE Tip-Adapter Math (Using the constants)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            # DTYPE SAFETY FIX
+            safe_beta = F.softplus(self.tip_beta).to(affinity.dtype) if isinstance(self.tip_beta, torch.Tensor) else self.tip_beta
+            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype) if isinstance(self.tip_alpha, torch.Tensor) else self.tip_alpha
             
-            # Scale up the cache_logits to match GLAli's inflated logit_scale
-            scaled_cache_logits = (cache_logits * logit_scale) * self.tip_alpha
+            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            
+            scaled_cache_logits = (cache_logits * logit_scale) * gate
             
             tip_logits = logits + scaled_cache_logits
             tip_logits_local = logits_local + scaled_cache_logits
@@ -431,10 +437,12 @@ class LocProto(TrainerX):
         cache_keys, cache_values = self.build_lesion_cache()
         target_model.inject_tip_adapter(cache_keys, cache_values, len(self.dm.dataset.classnames))
         
-        print("Configuring Tip-Adapter-F Optimizer (Training Keys ONLY)...")
-        # ONLY pass the cache keys to the optimizer. Force it to do the hard work!
-        tip_params =[target_model.tip_adapter.weight]
-        
+        print("Configuring Tip-Adapter-F Optimizer...")
+        tip_params =[
+            target_model.tip_adapter.weight,
+            target_model.tip_alpha,
+            target_model.tip_beta
+        ]
         optimizer_tip = torch.optim.AdamW(tip_params, lr=0.001, eps=1e-4)
         
         train_epochs_tip = 20
@@ -489,8 +497,8 @@ class LocProto(TrainerX):
         tip_state = {
             "tip_adapter.weight": target_model.tip_adapter.weight.detach().cpu(),
             "cache_values": target_model.cache_values.detach().cpu(),
-            "tip_alpha": target_model.tip_alpha,  # Now just saving the float
-            "tip_beta": target_model.tip_beta     # Now just saving the float
+            "tip_alpha": target_model.tip_alpha.detach().cpu(),
+            "tip_beta": target_model.tip_beta.detach().cpu()
         }
         torch.save(tip_state, osp.join(self.output_dir, "tip_state.pth"))
         print(f"Saved Tip-Adapter state to {osp.join(self.output_dir, 'tip_state.pth')}")
@@ -601,10 +609,8 @@ class LocProto(TrainerX):
             target_model.tip_adapter = nn.Linear(weight.shape[1], weight.shape[0], bias=False).to(target_model.dtype).cuda()
             target_model.tip_adapter.weight = nn.Parameter(weight.cuda())
             target_model.cache_values = tip_state["cache_values"].cuda()
-            
-            # Load as floats, not nn.Parameter
-            target_model.tip_alpha = tip_state["tip_alpha"]
-            target_model.tip_beta = tip_state["tip_beta"]
+            target_model.tip_alpha = nn.Parameter(tip_state["tip_alpha"].cuda())
+            target_model.tip_beta = nn.Parameter(tip_state["tip_beta"].cuda())
             
             target_model.use_tip_adapter = True
             print("Tip-Adapter successfully restored for evaluation!")
