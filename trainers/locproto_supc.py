@@ -177,72 +177,78 @@ class CustomCLIP(nn.Module):
         self.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.cache_values = cache_values.to(self.dtype).cuda()
         
-        # Learnable Sigmoid Gate and Beta
-        self.tip_alpha = nn.Parameter(torch.zeros(1, n_cls, dtype=self.dtype, device=self.device))
-        self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype, device=self.device))
+        # EXACT Tip-Adapter constants (No Sigmoid, No Learnable Params)
+        self.tip_alpha = 1.0  
+        self.tip_beta = 5.5   
         
         self.use_tip_adapter = True
 
     def forward(self, image, mask=None, labels=None, phase='glali'):
-        with torch.no_grad():
-            image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
-            image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
         
-        image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
-
-        text_prototypes = self.text_prototypes.detach()
-        n_disc, c, d = text_prototypes.shape
-        id_loc_feats = None
-        ood_loc_feats = None
-        l2p = None
-        l2p_tea = None
+        # If we are in Stage 2 (tip_train) or Inference, WE DO NOT TRACK GRADIENTS for GLAli
+        # This saves massive amounts of VRAM!
+        context_manager = torch.no_grad() if phase in ['tip_train', 'eval'] else torch.enable_grad()
         
-        if labels is not None and self.cfg.is_bonder:
-            bs = labels.shape[0]
-            l2p = text_prototypes[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
-            l2p_tea = self.all_text_features_tea[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
-            l2p = torch.transpose(l2p, 0, 1)
-            l2p_tea = torch.transpose(l2p_tea, 0, 1)
-
-            sim = local_image_features @ (l2p.mean(dim=1, keepdim=True).transpose(1,2))
-            sim = sim.squeeze(-1)
-            _, idx = torch.topk(input=sim, k=self.cfg.topk)
-            _, idx_ood = torch.topk(input=sim, k=self.cfg.topk, largest=False)
-
-            l2p_loc = l2p[:, 1:, :]
-            selected_loc_img_feats = torch.gather(local_image_features, 1, idx.unsqueeze(-1).expand(-1, -1, d))
-
-            id_loc_feats = selected_loc_img_feats
-            ood_loc_feats = torch.gather(local_image_features, 1, idx_ood.unsqueeze(-1).expand(-1, -1, d))
+        with context_manager:
+            with torch.no_grad(): # Teacher is always frozen
+                image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
+                image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
             
-            text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
-            text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
-            alpha = self.cfg.lambda_value
-            updated_proto = self.text_prototypes
+            image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
+
+            text_prototypes = self.text_prototypes.detach()
+            n_disc, c, d = text_prototypes.shape
+            id_loc_feats = None
+            ood_loc_feats = None
+            l2p = None
+            l2p_tea = None
             
-            contra_labels = torch.arange(c).view(-1,1).cuda()
-            mask = torch.eq(labels.unsqueeze(1), contra_labels.T).to(self.dtype).cuda()
-            update_features = torch.matmul(mask.view(bs, c).transpose(0,1).unsqueeze(0).repeat(n_disc-1,1,1), text_bias.transpose(1, 0))
-            proto_mask = torch.zeros(c, dtype=torch.int).cuda()
-            proto_mask[labels] = 1
-            proto_mask = proto_mask.view(1, -1, 1).repeat(n_disc, 1, d)
-            update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
-            updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
+            if labels is not None and self.cfg.is_bonder:
+                bs = labels.shape[0]
+                l2p = text_prototypes[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
+                l2p_tea = self.all_text_features_tea[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
+                l2p = torch.transpose(l2p, 0, 1)
+                l2p_tea = torch.transpose(l2p_tea, 0, 1)
 
-            updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
-            updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
-        else:
-            updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
-            updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+                sim = local_image_features @ (l2p.mean(dim=1, keepdim=True).transpose(1,2))
+                sim = sim.squeeze(-1)
+                _, idx = torch.topk(input=sim, k=self.cfg.topk)
+                _, idx_ood = torch.topk(input=sim, k=self.cfg.topk, largest=False)
 
-        logit_scale = self.logit_scale.exp()
-        
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+                l2p_loc = l2p[:, 1:, :]
+                selected_loc_img_feats = torch.gather(local_image_features, 1, idx.unsqueeze(-1).expand(-1, -1, d))
+
+                id_loc_feats = selected_loc_img_feats
+                ood_loc_feats = torch.gather(local_image_features, 1, idx_ood.unsqueeze(-1).expand(-1, -1, d))
+                
+                text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
+                text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
+                alpha = self.cfg.lambda_value
+                updated_proto = self.text_prototypes
+                
+                contra_labels = torch.arange(c).view(-1,1).cuda()
+                mask = torch.eq(labels.unsqueeze(1), contra_labels.T).to(self.dtype).cuda()
+                update_features = torch.matmul(mask.view(bs, c).transpose(0,1).unsqueeze(0).repeat(n_disc-1,1,1), text_bias.transpose(1, 0))
+                proto_mask = torch.zeros(c, dtype=torch.int).cuda()
+                proto_mask[labels] = 1
+                proto_mask = proto_mask.view(1, -1, 1).repeat(n_disc, 1, d)
+                update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
+                updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
+
+                updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
+                updated_proto_mean = updated_proto_norm.mean(dim=0)
+                updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+            else:
+                updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
+                updated_proto_mean = updated_proto_norm.mean(dim=0)
+                updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+
+            logit_scale = self.logit_scale.exp()
+            
+            logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
+            logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
 
         # ---------------- STAGE 2 & INFERENCE: LOCAL LESION TIP-ADAPTER ----------------
         if self.use_tip_adapter:
@@ -263,13 +269,12 @@ class CustomCLIP(nn.Module):
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
             affinity = self.tip_adapter(lesion_query)
-            affinity = torch.clamp(affinity, max=1.0)
             
-            safe_beta = F.softplus(self.tip_beta) if isinstance(self.tip_beta, torch.Tensor) else self.tip_beta
-            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            # PURE Tip-Adapter Math (Using the constants)
+            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype) if isinstance(self.tip_alpha, torch.Tensor) else self.tip_alpha
-            scaled_cache_logits = (cache_logits * logit_scale) * gate
+            # Scale up the cache_logits to match GLAli's inflated logit_scale
+            scaled_cache_logits = (cache_logits * logit_scale) * self.tip_alpha
             
             tip_logits = logits + scaled_cache_logits
             tip_logits_local = logits_local + scaled_cache_logits
@@ -369,7 +374,21 @@ class LocProto(TrainerX):
     @torch.no_grad()
     def build_lesion_cache(self):
         print("Extracting Trained Visual Memory Cache (Lesion-Only)...")
-        cache_keys = []
+        
+        # FIX: Build a clean dataloader with test transforms and sequential sampling
+        from utils.data_manager import build_data_loader
+        from dassl.data.transforms import build_transform
+        tfm_test = build_transform(self.cfg, is_train=False)
+        cache_loader = build_data_loader(
+            self.cfg,
+            sampler_type="SequentialSampler",
+            data_source=self.dm.dataset.train_x,
+            batch_size=self.cfg.DATALOADER.TEST.BATCH_SIZE,
+            tfm=tfm_test,
+            is_train=False
+        )
+
+        cache_keys =[]
         cache_labels =[]
         
         target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -378,16 +397,14 @@ class LocProto(TrainerX):
         text_protos = target_model.text_prototypes.detach()
         n_disc, c, d = text_protos.shape
         
-        for batch in tqdm(self.train_loader_x, desc="Building Cache"):
+        for batch in tqdm(cache_loader, desc="Building Cache"):
             image = batch["img"].to(self.device)
             label = batch["label"].to(self.device)
             bs = image.shape[0]
             
-            # Extract features from the TRAINED image encoder
             _, local_feat, _ = target_model.image_encoder(image.type(target_model.dtype))
             local_feat = F.normalize(local_feat, p=2, dim=-1)
             
-            # Locate lesions using the ground truth label and trained text prototypes
             l2p = text_protos[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), label, :]
             l2p = torch.transpose(l2p, 0, 1)
             
@@ -414,12 +431,10 @@ class LocProto(TrainerX):
         cache_keys, cache_values = self.build_lesion_cache()
         target_model.inject_tip_adapter(cache_keys, cache_values, len(self.dm.dataset.classnames))
         
-        print("Configuring Tip-Adapter-F Optimizer...")
-        tip_params =[
-            target_model.tip_adapter.weight,
-            target_model.tip_alpha,
-            target_model.tip_beta
-        ]
+        print("Configuring Tip-Adapter-F Optimizer (Training Keys ONLY)...")
+        # ONLY pass the cache keys to the optimizer. Force it to do the hard work!
+        tip_params =[target_model.tip_adapter.weight]
+        
         optimizer_tip = torch.optim.AdamW(tip_params, lr=0.001, eps=1e-4)
         
         train_epochs_tip = 20
@@ -474,8 +489,8 @@ class LocProto(TrainerX):
         tip_state = {
             "tip_adapter.weight": target_model.tip_adapter.weight.detach().cpu(),
             "cache_values": target_model.cache_values.detach().cpu(),
-            "tip_alpha": target_model.tip_alpha.detach().cpu(),
-            "tip_beta": target_model.tip_beta.detach().cpu()
+            "tip_alpha": target_model.tip_alpha,  # Now just saving the float
+            "tip_beta": target_model.tip_beta     # Now just saving the float
         }
         torch.save(tip_state, osp.join(self.output_dir, "tip_state.pth"))
         print(f"Saved Tip-Adapter state to {osp.join(self.output_dir, 'tip_state.pth')}")
@@ -586,8 +601,10 @@ class LocProto(TrainerX):
             target_model.tip_adapter = nn.Linear(weight.shape[1], weight.shape[0], bias=False).to(target_model.dtype).cuda()
             target_model.tip_adapter.weight = nn.Parameter(weight.cuda())
             target_model.cache_values = tip_state["cache_values"].cuda()
-            target_model.tip_alpha = nn.Parameter(tip_state["tip_alpha"].cuda())
-            target_model.tip_beta = nn.Parameter(tip_state["tip_beta"].cuda())
+            
+            # Load as floats, not nn.Parameter
+            target_model.tip_alpha = tip_state["tip_alpha"]
+            target_model.tip_beta = tip_state["tip_beta"]
             
             target_model.use_tip_adapter = True
             print("Tip-Adapter successfully restored for evaluation!")
